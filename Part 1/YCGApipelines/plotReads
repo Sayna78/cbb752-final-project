@@ -1,0 +1,8 @@
+
+export BIOINFROOT=/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo
+
+source $BIOINFROOT/setup-lang-mccleary.sh
+
+source $BIOINFROOT/config/samtools-1.17
+
+python $BIOINFROOT/soft/plotReads_May2023/plotReads.py "$@"

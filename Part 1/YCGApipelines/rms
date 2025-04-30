@@ -1,0 +1,40 @@
+#!/bin/python3
+
+import sys
+import datetime
+import signal
+import time
+
+import arguments, parsePipeline, parseManifest, commands
+from Context import Context
+from util import die, keyboardInterruptHandler
+
+def main(argv):
+    signal.signal(signal.SIGINT, keyboardInterruptHandler)
+
+    context = Context()
+    context, argv = arguments.parseArguments(context, argv[1:])
+
+    if len(argv) == 0:
+        arguments.usage()
+        sys.exit(0)
+
+    pipe = parsePipeline.parsePipeline(context, argv)
+
+    if pipe.setupHeaderNoncommentLineCnt > 0 or len(pipe.setupArgvHeader) > 0:
+        context, sheets = arguments.parseArguments(context, pipe.setupOptionString.split())
+    else:
+        context, sheets = arguments.parseArguments(context, argv[1:])
+
+    arguments.checkArguments(context, pipe)
+
+    mft = parseManifest.parseManifest(pipe.setupSheets, sheets, pipe.startVariables, context.showProgressFlag)
+
+    cmdlist = commands.getCommands(pipe, mft, context.showProgressFlag)
+    commands.runCommands(cmdlist, mft, pipe, context)
+
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main(sys.argv)
+

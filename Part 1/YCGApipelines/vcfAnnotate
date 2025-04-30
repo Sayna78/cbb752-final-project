@@ -1,0 +1,17 @@
+
+host=`hostname | cut -f1 -d.`
+if [[ "$host" == "login1" || "$host" == "login2" ]] ; then
+   echo Error:  vcfAnnotate must be run from a compute node, not login node $host.
+   exit -1
+fi
+
+export BIOINFROOT=/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo
+
+source $BIOINFROOT/envs/setup-cytofWorkflow-mccleary.sh
+source $BIOINFROOT/lang/setup-mcc-java-1.8.0.sh
+
+source $BIOINFROOT/config/samtools-1.17
+source $BIOINFROOT/config/tabix
+
+export ROOTDIR=$BIOINFROOT/soft/vcfAnnotate_May2023
+python $ROOTDIR/vcfAnnotate.py $*

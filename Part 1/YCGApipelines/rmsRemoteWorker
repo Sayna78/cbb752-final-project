@@ -1,0 +1,345 @@
+#!/bin/python3
+
+import sys
+import datetime
+import os
+import time
+import multiprocessing
+import re
+import signal
+import socket
+import subprocess
+import tempfile
+import threading
+
+from subprocess import call
+from SocketChannelClient import SocketChannelClient
+from MyQueue import MyQueue, QueueClosed, QueueEmpty
+from MyThread import MyThread, ThreadStopped
+
+def main(argv):
+    if len(argv) != 6:
+        sys.stderr.write("Usage: rmsRemoteWorker workerId numNodes runDirPath localPath hostdecr\n")
+        sys.exit(-1)
+
+    workerId = argv[1]
+    numNodeStr = argv[2]
+    runDir = argv[3]
+    localPath = argv[4]
+    socketDescr = argv[5]
+
+    sendqueue = MyQueue()
+    recvqueue = MyQueue()
+
+    try:
+        numNodes = int(numNodeStr)
+    except TypeError:
+        sys.stderr.write("rmsRemoteWorker[" + workerId + "]:  Error:  numNodes argument is not an integer:  " + argv[2] + "\n")
+        sys.exit(-1)
+
+    if not os.path.exists(runDir):
+        sys.stderr.write("rmsRemoteWorker[" + workerId + "]:  Error:  runDirectory does not exist:  " + runDir + "\n")
+        sys.exit(-1)
+
+    useLocalFlag = (localPath != "-")
+    if useLocalFlag and not os.path.isdir(localPath):
+        sys.stderr.write("rmsRemoteWorker[" + workerId + "]:  Error:  local directory does not exist:  " + localPath + "\n")
+        sys.exit(-1)
+        
+    rootpath = runDir + "/worker" + workerId
+
+    logfile = rootpath + ".log"
+
+    log(logfile, "Starting rmsRemoteWorker " + workerId + ".\n")
+
+    (numcores, memSize) = getCpuAndMemStats()
+    memSize = int(memSize)
+    tmpSpace = getTmpSpaceSize(localPath)
+
+    if numNodes == 0:
+        numSlots = numcores
+    else:
+        numSlots = numNodes
+        if numNodes < numcores:
+            memSize = int(memSize * (numNodes * 1.0 / numcores))
+            tmpSpace = int(tmpSpace * (numNodes * 1.0 / numcores))
+
+    log(logfile, "Host:  " + socket.gethostname() + "\n")
+    log(logfile, "Cores:  %d     Memory:  %d       Tmp:  %d\n" % (numcores, memSize, tmpSpace))
+
+    log(logfile, "rmsRemoteWorker[" + workerId + "]:  Starting socket connection...\n")
+
+    try:
+        channel = SocketChannelClient(workerId, socketDescr, sendqueue, recvqueue)
+    except socket.error:
+        log(logfile, "rmsRemoteWorker[" + workerId + "]: Connection refused.  Stopping.\n")
+        sys.stderr.write("rmsRemoteWorker[" + workerId + "]: Connection refused.  Stopping.\n")
+        sys.exit(-1)
+
+    channel.daemon = True
+    channel.start()
+
+    log(logfile, "Connected.\n")
+
+    sendqueue.put("S %s %d %d %d" % (workerId, numSlots, memSize, tmpSpace))
+
+    localdir = None
+    children = {}
+
+    try:
+        if useLocalFlag and tmpSpace >= 20:
+            localdir = tempfile.mkdtemp(prefix="rms_worker_local_dir.", dir=localPath)
+        else:
+            localdir = tempfile.mkdtemp(prefix="rms_worker_local_dir.", dir=runDir)
+            useLocalFlag = False
+
+        activeProcess = None
+        try:
+            log(logfile, "Copying local files...\n")
+
+            localfilespath = runDir + "/localfiles.sh"
+            if os.path.exists(localfilespath):
+                activeProcess = subprocess.Popen(["bash", localfilespath, "1", "2", localdir], preexec_fn=os.setpgrp)
+                while activeProcess.poll() is None:
+                    if recvqueue.isClosed():
+                        raise QueueClosed("")
+                    MyThread.sleep(1)
+        except QueueClosed:
+            if activeProcess is not None:
+                try:
+                    os.kill(-activeProcess.pid, signal.SIGTERM)
+                    time.sleep(2)
+                    os.kill(-activeProcess.pid, signal.SIGKILL)
+                except:
+                    pass
+            sys.exit(-1)
+
+        tmpSpace = getTmpSpaceSize(localPath)
+
+        workreturnqueue = MyQueue()
+        tmppermlock = threading.Lock()
+
+        log(logfile, "rmsRemoteWorker[" + workerId + "]:  Starting main loop...\n")
+
+        jobcnt = 0
+        running = True
+        while running or jobcnt > 0:
+            if running:
+                try:
+                    line = recvqueue.get(False)
+                    if line is None:
+                        log(logfile, "rmsRemoteWorker[" + workerId + "]:  Pipe closed by other side.  Stopping with " + str(len(children)) + " running processes.\n")
+                        MyQueue.closeAllQueues()
+                        MyThread.stopAllThreads()
+                        running = False
+                        break
+
+                    log(logfile, "rmsRemoteWorker[" + workerId + "]:  Got script " + line + "\n")
+
+                    if line.startswith("-1"):
+                        running = False
+                        continue
+
+                    fields = line.strip().split()
+                    if len(fields) != 2:
+                        sys.stderr.write("rmsRemoteWorker[" + workerId + "]:  Error:  Invalid commandIdx line:  " + line.strip() + "\n")
+                        sys.exit(-1)
+
+                    idxstr = fields[0]
+                    localSpace = int(fields[1])
+                    if useLocalFlag and localSpace <= tmpSpace:
+                        tmpSpace -= localSpace
+                        tmproot = localPath
+                    else:
+                        localSpace = 0
+                        tmproot = runDir
+
+                    shprefix = runDir + "/script." + idxstr
+                    shpath = shprefix + ".sh"
+                    if not os.path.exists(shpath):
+                        subdir = str(int((int(int(idxstr) / 100) + 1) * 100))
+                        shprefix = runDir + "/" + subdir + "/script." + idxstr
+                        shpath = shprefix + ".sh"
+
+                    if not os.path.exists(shpath):
+                        sys.stderr.write("rmsRemoteWorker[" + workerId + "]:  Error: script path does not exist:  " + shpath + "\n")
+                        sys.stderr.write("   PWD: " + os.getcwd() + "\n")
+                        sendqueue.put("C " + workerId + " " + idxstr + " -1 -1")
+                    else:
+                        log(logfile, "rmsRemoteWorker[" + workerId + "]:  Running script." + idxstr + ".sh\n")
+
+                        child = RunCommand(workerId, runDir, idxstr, shprefix, localdir, tmproot, workreturnqueue, tmppermlock)
+                        child.start()
+                        children[idxstr] = (child, localSpace)
+                        jobcnt += 1
+
+                except QueueEmpty:
+                    pass
+                except QueueClosed:
+                    if len(children) > 0:
+                        log(logfile, "rmsRemoteWorker[" + workerId + "]:  Queue closed.  Stopping with " + str(len(children)) + " running processes.\n")
+                        MyQueue.closeAllQueues()
+                        MyThread.stopAllThreads()
+                        running = False
+                    else:
+                        log(logfile, "rmsRemoteWorker[" + workerId + "]:  Queue closed.\n")
+                    sys.exit(-1)
+
+            if jobcnt > 0:
+                try:
+                    line = workreturnqueue.get(False)
+                    log(logfile, "Received job status:  " + line + "\n")
+                    fields = line.split()
+                    idxstr = fields[2]
+
+                    children[idxstr][0].join()
+                    tmpSpace += children[idxstr][1]
+                    del children[idxstr]
+                    sendqueue.put(line)
+                    jobcnt -= 1
+                except QueueEmpty:
+                    pass
+
+            MyThread.sleep(1)
+
+    finally:
+        if localdir is not None:
+            call(["rm", "-rf", localdir])
+
+    return 0
+
+class RunCommand(MyThread):
+    def __init__(self, workerId, runDir, cmdidx, prefix, localdir, tmproot, workreturnqueue, tmppermlock):
+        MyThread.__init__(self)
+        self.workerId = workerId
+        self.runDir = runDir
+        self.cmdidx = cmdidx
+        self.prefix = prefix
+        self.localdir = localdir
+        self.tmproot = tmproot
+        self.workreturnqueue = workreturnqueue
+        self.tmppermlock = tmppermlock
+
+    def myrun(self):
+        shpath = self.prefix + ".sh"
+        outpath = self.prefix + ".out"
+        errpath = self.prefix + ".err"
+
+        activeProcess = None
+        tmpdir = ""
+        permdir = ""
+        try:
+            tmpdir = tempfile.mkdtemp(prefix="rms_step_tmp_dir.", dir=self.tmproot)
+            permdir = tempfile.mkdtemp(prefix="rms_step_perm_dir.", dir=self.tmproot)
+
+            tmpfilespath = self.prefix + ".tmpfiles.sh"
+            if os.path.exists(tmpfilespath):
+                self.tmppermlock.acquire()
+                try:
+                    activeProcess = subprocess.Popen(["bash", tmpfilespath, tmpdir], preexec_fn=os.setpgrp)
+                    while activeProcess.poll() is None:
+                        MyThread.sleep(1)
+                    activeProcess = None
+                finally:
+                    self.tmppermlock.release()
+
+            cmd = "bash " + shpath + " " + tmpdir + " " + permdir + " " + self.localdir + " > " + outpath + " 2> " + errpath
+#            sys.stdout.write(" CMD: " + cmd + "\n")
+#            sys.stdout.flush()
+
+            activeProcess = subprocess.Popen(cmd, shell=True, stderr=subprocess.PIPE, preexec_fn=os.setpgrp, universal_newlines=True, bufsize=-1)
+            while activeProcess.poll() is None:
+                MyThread.sleep(1)
+
+            status = activeProcess.returncode
+            if status != 0:
+                errstr = activeProcess.stderr.read()
+                fp = open(errpath, "a")
+                fp.write(errstr)
+                fp.close()
+
+            activeProcess = None
+
+            qcstatus = 0
+            if status == 0:
+                qcpath = self.prefix + ".qc.sh"
+                if os.path.exists(qcpath):
+                    qcoutpath = self.prefix + ".qc.out"
+                    qcerrpath = self.prefix + ".qc.err"
+                    cmd = "bash " + qcpath + " " + tmpdir + " " + permdir + " " + self.localdir + " > " + qcoutpath + " 2> " + qcerrpath
+
+                    activeProcess = subprocess.Popen(cmd, shell=True, preexec_fn=os.setpgrp)
+                    while activeProcess.poll() is None:
+                        MyThread.sleep(1)
+
+                    qcstatus = activeProcess.returncode
+                    activeProcess = None
+
+            if status == 0 and qcstatus == 0:
+                permfilespath = self.prefix + ".permfiles.sh"
+                if os.path.exists(permfilespath):
+                    self.tmppermlock.acquire()
+                    try:
+                        activeProcess = subprocess.Popen(["bash", permfilespath, permdir], preexec_fn=os.setpgrp)
+                        while activeProcess.poll() is None:
+                            MyThread.sleep(1)
+                        activeProcess = None
+                    finally:
+                        self.tmppermlock.release()
+
+            self.workreturnqueue.put("C " + self.workerId + " " + self.cmdidx + " " + str(status) + " " + str(qcstatus))
+
+#            sys.stdout.write("Finished command " + self.cmdidx + "\n")
+#            sys.stdout.flush()
+
+        except ThreadStopped:
+#            sys.stdout.write("Killing command " + self.cmdidx + "\n")
+#            sys.stdout.flush()
+
+            if activeProcess is not None:
+                try:
+                    os.kill(-activeProcess.pid, signal.SIGTERM)
+                    time.sleep(2)
+                    os.kill(-activeProcess.pid, signal.SIGKILL)
+                except:
+                    pass
+
+        finally:
+            if tmpdir:
+                call(["rm", "-rf", tmpdir])
+            if permdir:
+                call(["rm", "-rf", permdir])
+
+def log(logfile, msg):
+    try:
+        fp = open(logfile, "a")
+        fp.write(datetime.datetime.now().strftime('[%Y-%m-%d %H:%M:%S]  '))
+        fp.write(msg)
+        fp.close()
+    except IOError:
+        pass
+
+def getCpuAndMemStats():
+    numcpu = multiprocessing.cpu_count()
+    memsize = 10000
+
+    meminfo = open("/proc/meminfo").read()
+    match = re.search(r"^MemTotal:\s+(\d+)\s", meminfo)
+    if match:
+        memsize = int(int(match.group(1)) / (1024 * 1024))
+
+    return (numcpu, memsize)
+
+def getTmpSpaceSize(path):
+    line = subprocess.Popen("df --block-size=1000 " + path + " | tail -1", shell=True,stdout=subprocess.PIPE, universal_newlines=True).communicate()[0]
+    line = str(line)
+
+    try:
+        fields = line.strip().split()
+        sys.stdout.flush()
+        return int(int(fields[3]) / 1000000)
+    except:
+        return 0
+
+if __name__ == "__main__":
+    main(sys.argv)

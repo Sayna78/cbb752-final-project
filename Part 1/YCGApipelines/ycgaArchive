@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+
+import sys
+import getpass
+import inspect
+import os
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+
+BINDIR = os.path.dirname(os.path.realpath(inspect.stack()[0][1]))
+
+outputDir = None
+gzipFlag = False
+sampleDirFlag = False
+noNoticeFlag = False
+debugFlag = False
+
+arg = 1
+while arg < len(sys.argv):
+    if sys.argv[arg] == "-z":
+        gzipFlag = True
+        arg += 1
+    elif sys.argv[arg] == "-y":
+        sampleDirFlag = True
+        arg += 1
+    elif sys.argv[arg] == "-d":
+        if getpass.getuser() in ("jk2269", "rdb9"):
+            debugFlag = True
+        arg += 1
+    elif sys.argv[arg] == "-n":
+        noNoticeFlag = True
+        arg += 1
+    elif arg + 1 < len(sys.argv) and sys.argv[arg] == "-o":
+        outputDir = sys.argv[arg+1]
+        arg += 2
+    else:
+        break
+
+if arg == len(sys.argv):
+    sys.stderr.write("Usage:  ycgaArchive [-z] [-y] [-o outputDir] fullPathToProjectDir sampleDir...\n")
+    sys.stderr.write("           This program extracts fastq files from the YCGA archive, using the path information\n")
+    sys.stderr.write("           as it existed when the fastq files were on disk.  Specifically, it takes one 'Project_netId'\n")
+    sys.stderr.write("           folder from a flowcell and extracts the samples and their fastq files in that folder.\n")
+    sys.stderr.write("\n")
+    sys.stderr.write("           Note:  This script is unable to retrieve files sequenced in the 2010-2011, please contact\n")
+    sys.stderr.write("                  YCGA personnel for retrieval of data in that timeframe.\n")
+    sys.stderr.write("\n")
+    sys.stderr.write("           Arguments:\n")
+    sys.stderr.write("              fullPathToProjectDir  - Must be the full path to a sequencing run 'Project_netId' directory,")
+    sys.stderr.write("                                      as it appeared online, when files were stored on disk\n")
+    sys.stderr.write("              sampleDir...          - An optional list of samples to extract from the archive\n")
+    sys.stderr.write("                                         (by default all sample directories are extracted)\n")
+    sys.stderr.write("\n")
+    sys.stderr.write("           Options:\n")
+    sys.stderr.write("              -z           - Convert fastq files to gzipped fastq.gz\n")
+    sys.stderr.write("              -y           - Output directory structure in ycgaFastq format\n")
+    sys.stderr.write("              -o outputDir - Write output into given directory\n")
+    sys.exit(-1)
+
+PROGRAMDIR="/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/programs"
+
+projectDir = sys.argv[arg].rstrip("/")
+sampleDirs = [] if arg + 1 == len(sys.argv) else sys.argv[arg+1:]
+
+geraldFlag = False
+match = re.match("(.*)/Data/Intensities/BaseCalls/(Unalign[^/]+)/(Project_[^/]+)$", projectDir)
+if match is None:
+    match = re.search("Data/Intensities/BaseCalls.*GERALD.*", projectDir)
+    if match is not None:
+        geraldFlag = True
+        sampleDirs = []
+        gzipFlag = False
+    else:
+        sys.stderr.write("Error:  Path is not to a sequencing run Project_netId directory:  %s\n" % projectDir)
+        sys.exit(-1)
+
+if os.path.isdir(projectDir):
+    sys.stderr.write("Error:  Project directory is currently on disk, not in archive:  %s\n" % projectDir)
+    sys.exit(-1)
+    
+if outputDir:
+    if not os.path.isdir(outputDir):
+        sys.stderr.write("Error:  Output directory does not exist.\n")
+        sys.exit(-1)
+        
+    os.chdir(outputDir)
+
+def runcmd(cmd):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=-1,
+                         universal_newlines=True)
+    (outstr, errstr) = p.communicate()
+    return (p.returncode, outstr, errstr)
+
+def getSampleName(sampleDir):
+    sample = sampleDir.replace("Sample_", "")
+    if sample.endswith("_NOBCX"):
+        sample = sample[:-6]
+    else:
+        match = re.search("_\d\d\d$", sample)
+        if match is not None:
+            sample = sample[:-4]
+            match = re.search("_\d\d\d$", sample)
+            if match is not None:
+                sample = sample[:-4]
+    return sample
+    
+tmpdir = tempfile.mkdtemp(dir=".")
+tmppath = os.path.realpath(tmpdir)
+try:
+    os.chdir(tmpdir)
+    
+    # run getArchiveSamples
+
+    if not noNoticeFlag:
+        sys.stdout.write("Retrieving archive file, this may take a while...\n")
+        sys.stdout.flush()
+
+    pdirstr = projectDir
+    if debugFlag:
+        pdirstr = "debug:" + pdirstr
+        
+    cmd = "%s/getArchiveSamples %s %s" % (BINDIR, os.getcwd(), pdirstr)
+    
+    if socket.gethostname() != "transfer1.mccleary.ycrc.yale.edu":
+        cmd = "ssh -o StrictHostKeyChecking=no transfer " + cmd
+        
+    (code, outstr, errstr) = runcmd(cmd)
+    if code != 0 or len(errstr) > 0:
+        sys.stdout.write(outstr)
+        sys.stderr.write(errstr)
+        sys.exit(code if code != 0 else -1)
+
+    if debugFlag and len(outstr) > 0:
+        sys.stdout.write("getArchiveSamples command succeeded, producing the following output:\n%s\n" % outstr)
+        
+    # If a subset of samples are given on the command line, delete the other directories.
+
+    if debugFlag:
+        sys.stdout.write("On completion of getArchiveSamples:\n")
+        for dir in os.listdir("."):
+            sys.stdout.write("   %s\n" % dir)
+        sys.stdout.write("\n")
+        
+    if len(sampleDirs) > 0:
+        found = set()
+        for dir in os.listdir("."):
+            if dir.startswith("."): continue
+            if not os.path.isdir("./" + dir): continue
+            if dir == tmpdir:  continue
+            
+            if sampleDirFlag:
+                sample = getSampleName(dir)
+                if sample in sampleDirs:
+                    found.add(sample)
+                    continue
+            else:
+                if dir in sampleDirs:
+                    found.add(dir)
+                    continue
+
+            if debugFlag:
+                sys.stdout.write("Removing directory, not in sample list:  %s\n" % dir)
+                
+            shutil.rmtree("./" + dir)
+
+        if len(found) == 0:
+            sys.stderr.write("Error:  None of the sample directories found in the archive file.\n")
+            sys.exit(-1)
+            
+        if len(found) < len(sampleDirs):
+            notfound = set(sampleDirs) - found
+            sys.stderr.write("Error:  Could not find %d sample directories in the archive:  %s\n" % (len(notfound), ", ".join(sorted(list(notfound)))))
+            sys.stderr.flush()
+            
+    # If gzip flag, convert qp files to gz
+    
+    if gzipFlag:
+        for dir in os.listdir("."):
+            if dir.startswith("."): continue
+            if not os.path.isdir("./" + dir): continue
+
+            for file in os.listdir("./" + dir):
+                if not file.endswith(".fastq.qp"): continue
+
+                if not noNoticeFlag:
+                    sys.stdout.write("Converting fastq file %s...\n" % (dir + "/" + file))
+                    sys.stdout.flush()
+                
+                path = "./" + dir + "/" + file
+                gzpath = path.replace(".fastq.qp", ".fastq.gz")
+                cmd = "%s/Quip/bin/quip -d -c %s | %s/pigz-2.7/pigz -c -p 4 > %s" % (PROGRAMDIR, path,
+                                                                                     PROGRAMDIR, gzpath)
+                status = subprocess.call(cmd, shell=True)
+                if status != 0:
+                    sys.exit(status)
+
+    # If sampleDir flag, adjust structure to match ycgaFastq structure
+
+    if sampleDirFlag:
+        for dir in os.listdir("."):
+            if dir.startswith("."): continue
+            if not os.path.isdir("./" + dir): continue
+
+            sample = getSampleName(dir)
+            if sample != dir:
+                os.rename(dir, sample)
+
+        for dir in os.listdir("."):
+            if dir.startswith("."): continue
+            if not os.path.isdir("./" + dir): continue
+
+            os.mkdir(dir + "/Unaligned")
+            for file in os.listdir("./" + dir):
+                if file.endswith("fastq.qp") or file.endswith("fastq.gz"):
+                    src = "./" + dir + "/" + file
+                    dest = "./" + dir + "/Unaligned/" + file
+                    os.rename(src, dest)
+                    
+    # Move into output directory
+
+    if not geraldFlag:
+        for dir in os.listdir("."):
+            if dir.startswith("."): continue
+            if not os.path.isdir("./" + dir): continue
+
+            os.rename("./" + dir, "../" + dir)
+    else:
+        for dir in os.listdir("."):
+            if dir.endswith("fastq.qp"):
+                os.rename("./" + dir, "../" + dir)
+
+    if debugFlag:
+        sys.stdout.write("Final parent directory files:\n")
+        for dir in os.listdir(".."):
+            sys.stdout.write("   %s\n" % dir)
+        sys.stdout.write("\n")
+        
+finally:
+    if not debugFlag:
+        shutil.rmtree(tmppath)

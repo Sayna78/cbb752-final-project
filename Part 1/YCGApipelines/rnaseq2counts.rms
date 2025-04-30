@@ -1,0 +1,302 @@
+#!/usr/bin/env rms
+
+##python
+import sys
+import os.path
+import argparse
+import glob
+
+#genome = ""
+#ref = "default"
+
+# Check the command-line arguments, and output the genome name and chromosome ordering.
+parser = argparse.ArgumentParser(description="rnaseq2couns.rms  options sampleDir1 sampleDir2 ..." )
+parser.add_argument('--ref', type=str, default='hg38', help='Please, indicate the reference genome: hg38, hg38v27,mm39, mm10, S288C, rn6 or other (where for other, $REF and $GTF must be set to the reference fasta and GTF file, and $REF must be indexed for HISAT2) ')
+parser.add_argument('--unstranded', action='store_true', help='For unstranded libraries')
+parser.add_argument('--MAPQ', type=int, default=10, help='MAPQ to select mapped reads. 10 for keeping only "uniquely" map')
+parser.add_argument("folders", nargs="+", help="List of sample folders")
+
+# this is just examples to grow argument list
+# parser.add_argument('-hg19', action='store_true', help='Use hg19 instead of hg38')
+# parser.add_argument('--sampleFolder', default="Samples", type=str, help='Length of the UMI barcode')
+args = parser.parse_args()
+
+
+genome={}
+genome['hg38']="/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/config/hg38rnaseq_May2023"
+genome['hg38v27']="/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/config/hg38rnaseq"
+genome['mm10']="/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/genomes/mm10/annotation/mm10rnaseq"
+genome['mm39']="/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/genomes/mm39/annotation/mm39rnaseq"
+genome['S288C']="/home/jfl27/.pbm/S288Crnaseq"
+genome['rn6']="/home/sm2556/project/resources/genomes/Rattus_norvegicus/rattus_norvegicus.sh"
+genome['NeuroTri']="/home/jfl27/.pbm/NeuroTri"
+genome['Ncrassa']="/home/jfl27/.pbm/Ncrassarnaseq"
+genome['Triasper1']="/home/jfl27/.pbm/Triasper1"
+ 
+sys.stdout.write("##FullCommand=( %s )\n" % args)
+sys.stdout.write("##refver=( %s )\n" % genome[args.ref] if args.ref.lower() != "other" else "other")
+sys.stdout.write("##genome=( %s )\n" % args.ref)
+sys.stdout.write("##unstranded=( %s )\n" % args.unstranded)
+sys.stdout.write("##MAPQ=( %s )\n" % args.MAPQ)
+
+# Use glob to expand the wildcard pattern
+folders = []
+for pattern in args.folders:
+    folders.extend(glob.glob(pattern))
+
+#reading sample file
+sys.stdout.write("##sheet=EOF\n")
+sys.stdout.write('sample\n')
+for folder in folders:
+    sys.stdout.write('{0}\n'.format(folder))
+sys.stdout.write("EOF\n")
+
+sys.stdout.write("##SamplesProcessed=( %s )\n" % folders)
+
+##env
+module purge
+module load miniconda
+conda activate /home/jfl27/.conda/envs/RNAseq2counts
+
+if [ "<refver>" != "other" ] ; then
+   source <refver>
+fi
+
+
+#### FASTQC sample <sample>/.completed.fastqc
+fastqc <sample>/Unaligned/*.fastq.gz
+touch <sample>/.completed.fastqc
+
+#### trimming sample <sample>/.completed.trimming
+##io=4
+##ppn=4
+
+mkdir -p <sample>/Trimmed
+
+gzfiles=`echo <sample>/Unaligned/*_R1_*.fastq.gz`
+if [ "$gzfiles" == '<sample>/Unaligned/*_R1_*.fastq.gz' ] ; then gzfiles='' ; fi
+qpfiles=`echo <sample>/Unaligned/*_R1_*.fastq.qp`
+if [ "$qpfiles" == '<sample>/Unaligned/*_R1_*.fastq.qp' ] ; then qpfiles='' ; fi
+
+for fq in $gzfiles ; do
+    fq2="${fq/_R1_/_R2_}"
+
+    filename="${fq##*/}"
+    out1="${filename/.qp/.gz}"
+    out2="${out1/_R1_/_R2_}"
+
+    if [ -e $fq2 ] ; then
+       fastp -i $fq -I $fq2 -o <sample>/Trimmed/$out1 -O <sample>/Trimmed/$out2 -h <sample>/fastp.html -j <tmp>/fastp.json 2> <sample>/Trimmed/$out1.trim_stats.txt
+    else
+       fastp -i $fq -o <sample>/Trimmed/$out1 -h <sample>/fastp.html -j <tmp>/fastp.json 2> <sample>/Trimmed/$out1.trim_stats.txt
+    fi
+done
+
+for fq in $qpfiles ; do
+    fq2="${fq/_R1_/_R2_}"
+
+    filename="${fq##*/}"
+    out1="${filename/.qp/.gz}"
+    out2="${out1/_R1_/_R2_}"
+
+    if [ -e $fq2 ] ; then
+       quip -d -c $fq | pigz -c -p 4 --fast > <tmp>/$out1
+       quip -d -c $fq2 | pigz -c -p 4 --fast > <tmp>/$out2
+
+       fastp -i <tmp>/$out1 -I <tmp>/$out2 -o <sample>/Trimmed/$out1 -O <sample>/Trimmed/$out2 -h <sample>/fastp.html -j <tmp>/fastp.json 2> <sample>/Trimmed/$out1.trim_stats.txt
+    else
+       quip -d -c $fq | pigz -c -p 4 --fast > <tmp>/$out1
+
+       fastp -i <tmp>/$out1 -o <sample>/Trimmed/$out1 -h <sample>/fastp.html -j <tmp>/fastp.json 2> <sample>/Trimmed/$out1.trim_stats.txt
+    fi
+done
+
+touch <sample>/.completed.trimming
+
+#### HISAT2 sample <sample>/.completed.hisat2
+##ppn=10
+
+function join_by { local IFS="$1"; shift; echo "$*"; }
+
+SEstrand=""
+PEstrand=""
+if [ <unstranded> == "False" ]
+then
+    SEstrand="--rna-strandness R"
+    PEstrand="--rna-strandness RF"
+fi
+
+MAPQ=""
+if [ "<MAPQ>" != "0" ]
+then
+    MAPQ="-q <MAPQ>"
+fi
+
+cd <sample>
+
+R2001=`echo Trimmed/*_R2_*.fastq.gz`
+R1reads=`join_by , Trimmed/*_R1_*.fastq.gz`
+R2reads=`join_by , Trimmed/*_R2_*.fastq.gz`
+
+#Alignment with HISAT2 SE or PE
+if [ "$R2001" == "Trimmed/*_R2_*.fastq.gz" ] 
+then
+    #touch .SeqType__SE
+    hisat2 -p <ppn> -t --dta -x $REF $SEstrand -U $R1reads --summary-file hisat2_summary.txt | \
+        samtools view -hb -@ <ppn> $MAPQ - > <tmp>/aligned.out.bam
+else
+    #touch .SeqType__PE
+    hisat2 -p <ppn> -t --dta -x $REF $PEstrand -1 $R1reads -2 $R2reads --summary-file hisat2_summary.txt | \
+        samtools view -hb -@ <ppn> $MAPQ - > <tmp>/aligned.out.bam
+fi
+
+samtools sort -@ <ppn> -m 2G -T <tmp>/samsort <tmp>/aligned.out.bam > <sample>.bam
+samtools index -@ <ppn> <sample>.bam
+
+touch .completed.hisat2
+
+#### Trimming2 sample <sample>/.completed.align
+##after=hisat2
+
+rm -f <sample>/Trimmed/*.fastq.gz
+
+touch <sample>/.completed.align
+
+
+#### Picard sample <sample>/picard_QualityYieldMetrics.txt
+##after=hisat2
+##io=6
+
+cd <sample>
+picard CollectQualityYieldMetrics I=<sample>.bam O=picard_QualityYieldMetrics.txt
+
+#### Picard2 sample <sample>/picard_RnaSeqMetrics.txt
+##io=6
+
+cd <sample>
+
+[[ "<unstranded>" = "True" ]] && STRAND='NONE' || STRAND='SECOND_READ_TRANSCRIPTION_STRAND'
+
+picard CollectInsertSizeMetrics I=<sample>.bam O=picard_InsertSizeMetrics.txt H=picard_InsertSizeHistogram.pdf
+
+picard CollectRnaSeqMetrics I=<sample>.bam O=picard_RnaSeqMetrics.txt REF_FLAT=$REF_FLAT \
+    STRAND_SPECIFICITY=$STRAND RIBOSOMAL_INTERVALS=$RRNA_INTERVALS
+
+#### compilingStats sample <sample>/rnaseqMetrics_<sample>.txt 
+
+/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/soft/rnautil_May2023/rnaseq_statsNew.py <sample> > <sample>/rnaseqMetrics_<sample>.txt
+
+#### mergeStats all rnaseq_metrics.txt
+
+/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/soft/rnautil_May2023/colstats_merge.py <sample,glob=True>/rnaseqMetrics* > rnaseq_metrics.xls
+
+#### StringTie sample <sample>/.completed.StringTie
+##after=hisat2
+##ppn=4
+
+mkdir -p <sample>/stringtie
+
+stringtie -e -B -p <ppn> -G $GTF -o <sample>/stringtie/<sample>.gtf -A <sample>/stringtie/gene_abund.tab <sample>/<sample>.bam
+
+touch <sample>/.completed.StringTie
+
+#### StringTie_Counts all DESeq2/gene_count_matrix.csv
+##after=picard,StringTie
+
+LENGTH=`awk 'NR==8{print $3}' */picard_QualityYieldMetrics.txt`
+
+mkdir -p <tmp>/stringtie
+
+for sample in <sample> ; do 
+   mkdir -p <tmp>/stringtie/$sample
+   cp $sample/stringtie/$sample.gtf <tmp>/stringtie/$sample
+done
+
+mkdir -p DESeq2
+
+/home/jfl27/python_utils/prepDE.py3 -i <tmp>/stringtie -g DESeq2/gene_count_matrix.csv -t DESeq2/transcript_count_matrix.csv -l $LENGTH
+
+#### StringTie_Raw sample <sample>/.completed.StringTie2
+##after=hisat2
+##ppn=4
+
+mkdir -p <sample>/discovery
+
+stringtie -p <ppn> -G $GTF -o <sample>/discovery/stringtie_raw.gtf <sample>/<sample>.bam
+
+touch <sample>/.completed.StringTie2
+
+#### StringTie_Merge all discovery_stringtie_transcripts.gtf
+##ppn=5
+
+stringtie --merge -p <ppn> -G $GTF -o discovery_stringtie_transcripts.gtf <sample,glob=True>/discovery/stringtie_raw.gtf
+
+#### StringTie2 sample DESeq2/gene_count_matrix_discovery.csv
+##ppn=4
+
+stringtie -p <ppn> -e -B -G discovery_stringtie_transcripts.gtf -A <sample>/discovery/gene_abund_discovery.tab -o <sample>/discovery/<sample>.gtf <sample>/<sample>.bam
+
+touch <sample>/.completed.StringTie3
+
+#### StringTie_Discovery all DESeq2/gene_count_matrix_discovery.csv
+##after=picard,StringTie2
+
+LENGTH=`awk 'NR==8{print $3}' */picard_QualityYieldMetrics.txt`
+
+mkdir -p <tmp>/discovery
+
+for sample in <sample> ; do 
+   mkdir -p <tmp>/discovery/$sample
+   cp $sample/discovery/$sample.gtf <tmp>/discovery/$sample
+done
+
+mkdir -p DESeq2
+
+/home/jfl27/python_utils/prepDE.py3 -i <tmp>/discovery -g DESeq2/gene_count_matrix_discovery.csv -t DESeq2/transcript_count_matrix_discovery.csv -l $LENGTH
+
+#### PipelineReport all -
+
+multiqc -f ./
+
+OUTFILE="Pipeline_doc.txt"
+rm -f $OUTFILE
+touch $OUTFILE
+
+echo $REF >>$OUTFILE
+echo $GTF >>$OUTFILE
+
+# List of software and their version commands
+software_versions=(
+    "fastqc --version"
+    "fastp --version"
+    "hisat2 --version"
+    "stringtie --version"
+    "multiqc --version"
+    #"picard CollectRnaSeqMetrics --version"
+    #"samtools --version"
+    # Add more software as needed
+)
+
+# Loop through each software
+for cmd in "${software_versions[@]}"; do
+    # Run the version command and redirect output to a temporary file
+    temp_file=$(mktemp)
+    $cmd > "$temp_file" 2>&1
+
+    # Extract the first line and append it to the output file
+    head -n 1 "$temp_file" >> "$OUTFILE"
+
+    # Remove the temporary file
+    rm "$temp_file"
+done
+
+hisat2CMD="hisat2 --dta -x REF directional:<unstrunded> -1 R1reads -2 R2reads | samtools view -hb <MAPQ>"
+stringtieCMD="stringtie -e -B -G GTF -o sample.gtf -A gene_abund.tab bam"
+stringtieDisc="stringtie -G $GTF -o stringtie_raw.gtf bam"
+stringtieMerge="stringtie --merge -G GTF -o discovery_stringtie_transcripts.gtf sample*/stringtie_raw.gtf"
+stringtieCMD2="stringtie -e -B -G discovery_stringtie_transcripts.gtf -A gene_abund_discovery.tab -o sample.gtf bam"
+
+echo -e "\nThese are decpictions of the main software used in this pipeline" >>$OUTFILE
+echo -e "$hisat2CMD\n$stringtieCMD\n$stringtieDisc\n$stringtieMerge\n$stringtieCMD2\n" >>$OUTFILE
+
+

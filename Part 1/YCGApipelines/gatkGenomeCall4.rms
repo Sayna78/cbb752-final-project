@@ -1,0 +1,519 @@
+#!/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/bin_May2023/rms
+
+##python
+
+import sys
+import os.path
+import re
+import subprocess
+
+genome = "auto"
+callMode = "joint"
+nodes = ""
+filterMode = "recalibration"
+cleanFlag = False
+
+# Check the command-line arguments, and output the genome name and chromosome ordering.
+argn = 1
+while argn < len(sys.argv):
+    if sys.argv[argn] == "-19":
+        genome = "hg19"
+        argn += 1
+    elif sys.argv[argn] == "-38":
+        genome = "hg38"
+        argn += 1
+    elif sys.argv[argn] == "-nj":
+        callMode = "per-sample"
+        argn += 1
+    elif sys.argv[argn] == "-hf":
+        filterMode = "hard-filter"
+        argn += 1
+    elif sys.argv[argn] == "-r":
+        cleanFlag = True
+        argn += 1
+    elif argn + 1 < len(sys.argv) and sys.argv[argn] == "-n":
+        nodes = sys.argv[argn+1]
+        argn += 2
+    else:
+        break
+
+errFlag = False
+if genome == "auto":
+    sys.stderr.write("Error:  The reference must be specified using either the -19 or -38 options.\n\n")
+    errFlag = True
+
+if argn == len(sys.argv) or errFlag:
+    sys.stderr.write("Usage:  gatkGenome.rms { -19 | -38 } [-r] [-nj] [-hf] [-n #] sampleDir...\n")
+    sys.stderr.write("                -19  - Use hg19 as the reference genome.  One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -38  - Use GRCh38 as the reference genome. One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -r   - Restart the computation from scratch, removing files from previous runs\n")
+    sys.stderr.write("                -nj  - Do not joint call, call each sample separately\n")
+    sys.stderr.write("                -hf  - Force hard filtering instead of variant recalibration\n")
+    sys.stderr.write("                -n # - Limit the number of compute nodes (same as RMS -n option format)\n")
+    sys.exit(-1)
+
+# Parse the sample directory arguments, find the fastq files, and generate the spreadsheet.
+sampleList = []
+for arg in sys.argv[argn:]:
+    dir = arg
+    if dir.endswith("/"):
+        dir = dir[:-1]
+
+    sampleName = os.path.basename(dir)
+    gvcf = dir + "/" + sampleName + ".g.vcf"
+    gvcfgz = dir + "/" + sampleName + ".g.vcf.gz"
+    if os.path.exists(gvcf) or os.path.exists(gvcfgz):
+        pass
+    else:
+        cram = dir + "/" + sampleName + ".cram"
+        if os.path.exists(cram):
+            pass
+        else:
+            bam = dir + "/" + sampleName + ".bam"
+            if os.path.exists(bam):
+                pass
+            else:
+                sys.stderr.write("Error:  Cannot find GVCF, CRAM or BAM file in sample directory:  " + arg + "\n")
+                sys.exit(-1)
+
+    sampleList.append(sampleName)
+
+if len(sampleList) < 500:
+   batchsize = len(sampleList)
+   batchMode = "single"
+else:
+   batchsize = 200
+   batchMode = "multi"
+
+batchnum = 1
+batchcnt = 0
+
+sys.stdout.write("##sheet=EOF\n")
+sys.stdout.write("Sample\tBatch\n")
+for i in range(len(sampleList)):
+    sampleName = sampleList[i]
+    sys.stdout.write("%s\t%d\n" % (sampleName, batchnum))
+    batchcnt += 1
+    if batchcnt == batchsize and i + 20 < len(sampleList):
+        batchnum += 1
+        batchcnt = 0
+sys.stdout.write("EOF\n")
+sys.stdout.write("##batchmode=( %s )\n" % batchMode)
+
+# If the restart option was given remove intermediate files.
+def runcmd(cmd):
+    p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate()
+    if p.returncode != 0:
+        sys.stderr.write("Error:  Command failed while removing existing files:  {0}\n".format(cmd))
+        sys.stderr.write(out)
+        sys.stderr.write(err)
+        sys.exit(-1)
+
+if cleanFlag:
+    cmd = "rm -f genome_calls.vcf* rawcalls*.vcf*"
+    runcmd(cmd)
+
+# Write the values as parameters to RMS
+if nodes:
+   sys.stdout.write('##option="-n %s"\n' % nodes)
+
+sys.stdout.write("##genome=( %s )\n" % genome)
+sys.stdout.write("##callmode=( %s )\n" % callMode)
+sys.stdout.write("##filtermode=( %s )\n" % filterMode)
+
+sys.stdout.write("##region=( 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 )\n")
+
+if genome == "hg19":
+   sys.stdout.write("##regionBySize=( 4 1 2 8 24 3 25 6 26 23 21 11 5 9 27 10 15 14 20 28 35 29 34 7 12 22 13 17 18 31 16 36 30 19 33 32 )\n")
+else:
+   sys.stdout.write("##regionBySize=( 4 10 8 1 2 24 25 6 26 3 14 23 11 5 35 27 21 20 15 22 28 29 12 18 17 31 13 34 16 7 30 36 33 9 19 32 )\n")
+
+##env
+
+export YCGAROOT=/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo
+export CONFIG=$YCGAROOT/config
+
+source $YCGAROOT/envs/setup-cytofWorkflow.sh
+source $YCGAROOT/lang/setup-mcc-java-1.8.0.sh
+
+export PATH=$PATH:$RMSDIR
+
+source $CONFIG/samtools-1.17
+source $CONFIG/gatk-4.1.2.0
+source $CONFIG/gatkutil_May2023
+source $CONFIG/tabix
+
+if [ "<genome>" == "hg19" ] ; then
+   source $CONFIG/hs37d5
+else
+   source $CONFIG/hs38DH
+fi
+
+REFROOT=`echo $REF | sed 's/\.fasta//'`
+
+##local=$REF
+##local=${REF}.fai
+##local=${REFROOT}.dict
+
+REFBASE=`basename $REF`
+
+#### haplotypeCaller sample,regionBySize <sample>/<sample>.g.vcf.gz
+##ppn=1
+##io=8
+##mem=14
+##local=10
+
+if [ -e <sample>/<sample>.g.vcf ] ; then
+   exit 0
+fi
+
+CRAM="<sample>/<sample>.cram"
+if ! [ -e $CRAM ] ; then
+   CRAM="<sample>/<sample>.bam"
+fi
+
+gatk HaplotypeCaller -R <local>/$REFBASE -I $CRAM \
+   -O <tmp>/<sample>.<regionBySize>.g.vcf.gz -ERC GVCF -L $SPLIT_REGIONS.<regionBySize>.bed
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.<regionBySize>.g.vcf.gz* <sample>
+
+#### mergeGVCF sample <sample>/<sample>.g.vcf.gz
+##ppn=4
+##mem=12
+##io=4
+
+if [ -e <sample>/<sample>.g.vcf ] ; then
+   exit 0
+fi
+
+bcftools concat --threads 6 -o <sample>/<sample>.g.vcf.gz -O z <sample>/<sample>.<region,glob=True>.g.vcf.gz
+tabix <sample>/<sample>.g.vcf.gz
+
+rm -f <sample>/<sample>.<region,glob=True>.g.vcf*
+
+#### GenotypeGVCF regionBySize rawcalls.vcf.gz
+##after=mergeGVCF
+##ppn=2
+##mem=55
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<batchmode>" != "single" ] ; then
+   exit 0
+fi
+
+if [ -e rawcalls.<regionBySize>.vcf.gz ] ; then
+   exit 0
+fi
+
+for sample in <sample>; do
+   if [ -e ${sample}/${sample}.g.vcf.gz ] ; then
+      echo ${sample}/${sample}.g.vcf.gz >> <tmp>/rawcalls.<regionBySize>.gvcf.list
+   else
+      echo ${sample}/${sample}.g.vcf >> <tmp>/rawcalls.<regionBySize>.gvcf.list
+   fi
+done
+
+gatk CombineGVCFs -R <local>/$REFBASE \
+   -V <tmp>/rawcalls.<regionBySize>.gvcf.list \
+   -O rawcalls.<regionBySize>.g.vcf.gz -L $SPLIT_REGIONS.<regionBySize>.bed
+
+gatk GenotypeGVCFs -R <local>/$REFBASE \
+   -V rawcalls.<regionBySize>.g.vcf.gz \
+   -O <tmp>/rawcalls.<regionBySize>.vcf.gz -L $SPLIT_REGIONS.<regionBySize>.bed
+
+mv <tmp>/rawcalls.<regionBySize>.vcf.gz .
+
+rm -f rawcalls.<regionBySize>.g.vcf.gz*
+
+#### BatchCombineGVCF batch,regionBySize rawcalls.vcf.gz
+##after=mergeGVCF
+##mem=16
+##io=2
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<batchmode>" == "single" ] ; then
+   exit 0
+fi
+
+if [ -e rawcalls.<regionBySize>.vcf.gz ] ; then
+   exit 0
+fi
+
+for sample in <sample>; do
+   if [ -e ${sample}/${sample}.g.vcf.gz ] ; then
+      echo ${sample}/${sample}.g.vcf.gz >> <tmp>/batch_<batch>.gvcf.list
+   else
+      echo ${sample}/${sample}.g.vcf >> <tmp>/batch_<batch>.gvcf.list
+   fi
+done
+
+gatk CombineGVCFs -R <local>/$REFBASE -V <tmp>/batch_<batch>.gvcf.list \
+   -L $SPLIT_REGIONS.<regionBySize>.bed -O batch_<batch>.<regionBySize>.g.vcf.gz
+
+#### BatchGenotypeGVCF regionBySize rawcalls.vcf.gz
+##ppn=2
+##mem=39
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<batchmode>" == "single" ] ; then
+   exit 0
+fi
+
+if [ -e rawcalls.<regionBySize>.vcf.gz ] ; then
+   exit 0
+fi
+
+for batch in <batch> ; do
+    echo batch_${batch}.<regionBySize>.g.vcf.gz >> <tmp>/rawcalls.<regionBySize>.gvcf.list
+done
+
+gatk CombineGVCFs -R <local>/$REFBASE \
+   -V <tmp>/rawcalls.<regionBySize>.gvcf.list \
+   -O rawcalls.<regionBySize>.g.vcf.gz -L $SPLIT_REGIONS.<regionBySize>.bed
+
+gatk GenotypeGVCFs -R <local>/$REFBASE \
+   -V rawcalls.<regionBySize>.g.vcf.gz \
+   -O <tmp>/rawcalls.<regionBySize>.vcf.gz -L $SPLIT_REGIONS.<regionBySize>.bed
+
+rmssync -t --bwlimit=50000 <tmp>/rawcalls.<regionBySize>.vcf* .
+
+rm -f batch_*.<regionBySize>.g.vcf.gz
+
+#### mergeVCF all rawcalls.vcf.gz
+##after=GenotypeGVCF,BatchGenotypeGVCF
+##ppn=4
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<batchmode>" != "single" ] ; then
+   exit 0
+fi
+
+bcftools concat --threads 6 -o <tmp>/rawcalls.vcf.gz -O z rawcalls.<region,glob=True>.vcf.gz
+tabix <tmp>/rawcalls.vcf.gz
+
+rmssync -t --bwlimit=50000 <tmp>/rawcalls.vcf.gz* .
+
+rm -f rawcalls.<region,glob=True>.vcf*
+
+#### VariantRecal all genome_calls.vcf.gz
+##local=39
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<filtermode>" != "recalibration" ] ; then
+   exit 0
+fi
+
+echo "Start" `date`
+
+rmssync -t --bwlimit=50000 rawcalls.vcf.gz* <tmp>
+
+if [ "<genome>" == "hg19" ] ; then
+    SNPOPT="--resource:hapmap,known=false,training=true,truth=true,prior=15.0 ${BUNDLE}/zipped4/hapmap_3.3.b37.vcf.gz --resource:omni,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/1000G_omni2.5.b37.vcf.gz --resource:1000G,known=false,training=true,truth=false,prior=10.0 ${BUNDLE}/zipped4/1000G_phase1.snps.high_confidence.b37.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 ${BUNDLE}/zipped4/dbsnp_138.b37.vcf.gz"
+else
+    SNPOPT="--resource:hapmap,known=false,training=true,truth=true,prior=15.0 ${BUNDLE}/zipped4/hapmap_3.3.hg38.vcf.gz --resource:omni,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/1000G_omni2.5.hg38.vcf.gz --resource:1000G,known=false,training=true,truth=false,prior=10.0 ${BUNDLE}/zipped4/1000G_phase1.snps.high_confidence.hg38.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+fi
+
+echo "SNP Recal" `date`
+
+gatk VariantRecalibrator -R <local>/$REFBASE -V <tmp>/rawcalls.vcf.gz -O <tmp>/raw.SNPs.recal \
+   --tranches-file <tmp>/raw.SNPs.tranches $SNPOPT \
+   -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR -an DP \
+   -mode SNP
+
+echo "SNP Apply" `date`
+
+gatk ApplyVQSR -R <local>/$REFBASE -V <tmp>/rawcalls.vcf.gz --recal-file <tmp>/raw.SNPs.recal \
+   --tranches-file <tmp>/raw.SNPs.tranches \
+   -O <tmp>/recal.SNPs.vcf.gz -ts-filter-level 99.5 \
+   -mode SNP
+
+if [ "<genome>" == "hg19" ] ; then
+    INDELOPT="--resource:mills,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/Mills_and_1000G_gold_standard.indels.b37.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/dbsnp_138.b37.vcf.gz"
+else
+    INDELOPT="--resource:mills,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+fi
+
+echo "Indel Recal" `date`
+
+gatk VariantRecalibrator -R <local>/$REFBASE -V <tmp>/recal.SNPs.vcf.gz -O <tmp>/raw.Indels.recal \
+   --tranches-file <tmp>/raw.Indels.tranches $INDELOPT \
+   -an QD -an DP -an FS -an SOR -an ReadPosRankSum -an MQRankSum \
+   --max-gaussians 4 \
+   -mode INDEL
+
+echo "Indel Apply" `date`
+
+gatk ApplyVQSR -R <local>/$REFBASE -V <tmp>/recal.SNPs.vcf.gz --recal-file <tmp>/raw.Indels.recal \
+   --tranches-file <tmp>/raw.Indels.tranches \
+   -O <tmp>/genome_calls.vcf.gz -ts-filter-level 99.0 \
+   -mode INDEL
+
+echo "Copy" `date`
+
+rmssync -t --bwlimit=50000 <tmp>/genome_calls.vcf.gz* .
+
+echo "Done" `date`
+
+#### HardFiltering all genome_calls.vcf.gz
+##after=mergeVCF
+##mem=16
+
+# Hard filtering not really supported with GATK4, so use GATK3 hard filtering tools
+source $CONFIG/gatk-3.4
+
+if [ "<callmode>" != "joint" ] ; then
+   exit 0
+fi
+
+if [ "<filtermode>" != "hard-filter" ] ; then
+  exit 0
+fi
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType SNP -o <tmp>/raw_snps.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_snps.vcf -o <tmp>/filtered_snps.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType INDEL -o <tmp>/raw_indels.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_indels.vcf -o <tmp>/filtered_indels.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || MQ < 35.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType MIXED -o <tmp>/raw_mixed.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_mixed.vcf -o <tmp>/filtered_mixed.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0"
+
+gatk -T CombineVariants -R <local>/$REFBASE -V <tmp>/filtered_snps.vcf -V <tmp>/filtered_indels.vcf -V <tmp>/filtered_mixed.vcf \
+   -o <tmp>/final_calls.vcf.gz --assumeIdenticalSamples
+
+rm -f <tmp>/raw_* <tmp>/filtered*
+
+gatkLowQualityFilter.py <local>/$REFBASE <tmp>/final_calls.vcf.gz | bgzip -c > <tmp>/genome_calls.vcf.gz
+tabix <tmp>/genome_calls.vcf.gz
+
+rmssync -t --bwlimit=50000 <tmp>/genome_calls.vcf.gz* .
+
+#### GenotypeGVCFPerSample sample,regionBySize <sample>/<sample>_rawcalls.vcf.gz
+##after=mergeGVCF
+##ppn=8
+##mem=20
+
+if [ "<callmode>" != "per-sample" ] ; then
+   exit 0
+fi
+
+gatk GenotypeGVCFs -R <local>/$REFBASE -V <sample>/<sample>.g.vcf.gz \
+   -O <tmp>/rawcalls.<regionBySize>.vcf.gz -L $SPLIT_REGIONS.<regionBySize>.bed
+
+rmssync -t --bwlimit=50000 <tmp>/rawcalls.<regionBySize>.vcf.gz* <sample>
+
+#### mergeVCFPerSample sample <sample>/<sample>_rawcalls.vcf.gz
+##ppn=4
+
+if [ "<callmode>" != "per-sample" ] ; then
+   exit 0
+fi
+
+bcftools concat --threads 6 -o <sample>/<sample>_rawcalls.vcf.gz -O z <sample>/rawcalls.<region,glob=True>.vcf.gz
+tabix <sample>/<sample>_rawcalls.vcf.gz
+
+rm -f <sample>/rawcalls.<region,glob=True>.vcf*
+
+#### HardFilteringPerSample sample <sample>/<sample>_calls.vcf.gz
+##mem=14
+
+# Hard filtering not really supported with GATK4, so use GATK3 hard filtering tools
+source $CONFIG/gatk-3.4
+
+if [ "<callmode>" != "per-sample" ] ; then
+   exit 0
+fi
+
+if [ "<filtermode>" != "hard-filter" ] ; then
+  exit 0
+fi
+
+cd <sample>
+
+gatk -T SelectVariants -R <local>/$REFBASE -V <sample>_rawcalls.vcf.gz -selectType SNP -o <tmp>/raw_snps.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_snps.vcf -o <tmp>/filtered_snps.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V <sample>_rawcalls.vcf.gz -selectType INDEL -o <tmp>/raw_indels.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_indels.vcf -o <tmp>/filtered_indels.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || MQ < 35.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V <sample>_rawcalls.vcf.gz -selectType MIXED -o <tmp>/raw_mixed.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_mixed.vcf -o <tmp>/filtered_mixed.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0"
+
+gatk -T CombineVariants -R <local>/$REFBASE -V <tmp>/filtered_snps.vcf -V <tmp>/filtered_indels.vcf -V <tmp>/filtered_mixed.vcf \
+   -o <tmp>/final_calls.vcf.gz --assumeIdenticalSamples
+
+gatkLowQualityFilter.py <local>/$REFBASE <tmp>/final_calls.vcf.gz | bgzip -c > <tmp>/<sample>_calls.vcf.gz
+tabix <tmp>/<sample>_calls.vcf.gz
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>_calls.vcf.gz* .
+
+#### VariantRecalPerSample sample <sample>/<sample>_calls.vcf.gz
+##after=mergeVCFPerSample
+##local=20
+
+if [ "<callmode>" != "per-sample" ] ; then
+   exit 0
+fi
+
+if [ "<filtermode>" != "recalibration" ] ; then
+   exit 0
+fi
+
+rmssync -t --bwlimit=50000 <sample>/<sample>_rawcalls.vcf.gz* <tmp>
+
+if [ "<genome>" == "hg19" ] ; then
+    SNPOPT="--resource:hapmap,known=false,training=true,truth=true,prior=15.0 ${BUNDLE}/zipped4/hapmap_3.3.b37.vcf.gz --resource:omni,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/1000G_omni2.5.b37.vcf.gz --resource:1000G,known=false,training=true,truth=false,prior=10.0 ${BUNDLE}/zipped4/1000G_phase1.snps.high_confidence.b37.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=7.0 ${BUNDLE}/zipped4/dbsnp_138.b37.vcf.gz"
+else
+    SNPOPT="--resource:hapmap,known=false,training=true,truth=true,prior=15.0 ${BUNDLE}/zipped4/hapmap_3.3.hg38.vcf.gz --resource:omni,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/1000G_omni2.5.hg38.vcf.gz --resource:1000G,known=false,training=true,truth=false,prior=10.0 ${BUNDLE}/zipped4/1000G_phase1.snps.high_confidence.hg38.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+fi
+
+gatk VariantRecalibrator -R <local>/$REFBASE -V <tmp>/<sample>_rawcalls.vcf.gz -O <tmp>/raw.SNPs.recal \
+   --tranches-file <tmp>/raw.SNPs.tranches $SNPOPT \
+   -an QD -an MQ -an MQRankSum -an ReadPosRankSum -an FS -an SOR -an DP \
+   -mode SNP
+
+gatk ApplyVQSR -R <local>/$REFBASE -V <tmp>/<sample>_rawcalls.vcf.gz --recal-file <tmp>/raw.SNPs.recal \
+   --tranches-file <tmp>/raw.SNPs.tranches \
+   -O <tmp>/recal.SNPs.vcf.gz -ts-filter-level 99.5 \
+   -mode SNP
+
+if [ "<genome>" == "hg19" ] ; then
+    INDELOPT="--resource:mills,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/Mills_and_1000G_gold_standard.indels.b37.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/dbsnp_138.b37.vcf.gz"
+else
+    INDELOPT="--resource:mills,known=false,training=true,truth=true,prior=12.0 ${BUNDLE}/zipped4/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz --resource:dbsnp,known=true,training=false,truth=false,prior=2.0 ${BUNDLE}/zipped4/Homo_sapiens_assembly38.dbsnp138.vcf.gz"
+fi
+
+gatk VariantRecalibrator -R <local>/$REFBASE -V <tmp>/recal.SNPs.vcf.gz -O <tmp>/raw.Indels.recal \
+   --tranches-file <tmp>/raw.Indels.tranches $INDELOPT \
+   -an QD -an DP -an FS -an SOR -an ReadPosRankSum -an MQRankSum \
+   --max-gaussians 4 \
+   -mode INDEL
+
+gatk ApplyVQSR -R <local>/$REFBASE -V <tmp>/recal.SNPs.vcf.gz --recal-file <tmp>/raw.Indels.recal \
+   --tranches-file <tmp>/raw.Indels.tranches \
+   -O <tmp>/<sample>_calls.vcf.gz -ts-filter-level 99.0 \
+   -mode INDEL
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>_calls.vcf.gz* <sample>

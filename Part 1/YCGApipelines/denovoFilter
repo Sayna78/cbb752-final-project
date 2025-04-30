@@ -1,0 +1,214 @@
+#!/bin/python3
+
+import sys
+import gzip
+import re
+
+def main():
+    arg = 1
+    argc = len(sys.argv)
+
+    allFlag = False
+    if arg < argc and sys.argv[arg] == "-a":
+        allFlag = True
+        arg += 1
+
+    if argc - arg != 2:
+        sys.stderr.write("Usage:  denovo_filter.py [-a] pedFile vcfFile\n")
+        sys.exit(-1)
+
+    pedFile = sys.argv[arg]
+    vcfFile = sys.argv[arg+1]
+
+    # Read the PED file and build a list of lists (for each trio, a 3 element list of the names) for
+    # the trios and their column indices (which will be filled in below)
+    pedlist = []
+    idxlist = []
+    probands = set()
+    try:
+        fp = open(pedFile, "rt")
+        for line in fp.readlines():
+            fields = line.strip().split()
+            if len(fields) < 6:
+                sys.stderr.write("Error:  Too few columns for PED file:  %s" % line)
+                sys.exit(-1)
+            if fields[2] == "0" or fields[3] == "0":
+                continue
+            if fields[1] in probands:
+                sys.stderr.write("Error:  Proband %s occurs multiple times in PED file:  %s" % (fields[1], line))
+                sys.exit(-1)
+            probands.add(fields[1])
+
+            pedlist.append(fields[1:4])
+            idxlist.append([-1, -1, -1])
+        fp.close()
+    except IOError:
+        sys.stderr.write("Error:  Unable to read PED file:  %s\n" % pedFile)
+        sys.exit(-1)
+
+    # Read the VCF file, finding the trio column indices when the header line is read,
+    # then processing each variant line.
+    try:
+        fp = open(vcfFile, "rt") if not vcfFile.endswith(".gz") else gzip.open(vcfFile, "rt")
+        while True:
+            line = fp.readline()
+            if not line:
+                break
+
+            if line.startswith("#"):
+                if line.startswith("#CHROM"):
+                    addVCFHeader()
+                    setIndexes(line, pedlist, idxlist, pedFile, vcfFile)
+                sys.stdout.write(line)
+            else:
+                parseVCFLine(line, pedlist, idxlist, allFlag, vcfFile)
+        fp.close()
+    except IOError:
+        sys.stderr.write("Error:  Unable to read VCF file:  %s\n" % vcfFile)
+        sys.exit(-1)
+
+
+def setIndexes(line, pedlist, idxlist, pedFile, vcfFile):
+    fields = line.strip().split("\t")
+    samples = set()
+    for i in range(9, len(fields)):
+        if fields[i] in samples:
+            sys.stderr.write("Warning:  Sample %s occurs multiple times in VCF file, may affect results:  %s\n" % (fields[i], vcfFile))
+            sys.stderr.flush()
+        samples.add(fields[i])
+
+        for j in range(len(pedlist)):
+            if fields[i] == pedlist[j][0]:
+                idxlist[j][0] = i
+            if fields[i] == pedlist[j][1]:
+                idxlist[j][1] = i
+            if fields[i] == pedlist[j][2]:
+                idxlist[j][2] = i
+
+    errFlag = False
+    for i in range(len(pedlist)):
+        if idxlist[i][0] == -1:
+            sys.stderr.write("Error:  Unable to find sample %s in VCF file:  %s\n" % (pedlist[i][0], vcfFile))
+            errFlag = True
+        if idxlist[i][1] == -1:
+            sys.stderr.write("Error:  Unable to find sample %s in VCF file:  %s\n" % (pedlist[i][1], vcfFile))
+            errFlag = True
+        if idxlist[i][2] == -1:
+            sys.stderr.write("Error:  Unable to find sample %s in VCF file:  %s\n" % (pedlist[i][2], vcfFile))
+            errFlag = True
+    if errFlag:
+        sys.exit(-1)
+
+def addVCFHeader():
+    sys.stdout.write(
+"""##INFO=<ID=denovo,Number=1,Type=String,Description="Proband samples with de novo variant calls.">
+##INFO=<ID=denovoCnt,Number=1,Type=Integer,Description="Count of probands with de novo variant calls.">
+""")
+
+
+def parseVCFLine(line, pedlist, idxlist, allFlag, vcfFile):
+    fields = line.strip().split("\t")
+    chr = fields[0]
+    infostr = fields[7]
+    formatstr = fields[8]
+
+    if chr.startswith("chr"):
+        chr = chr[3:]
+        if chr == "M":
+            chr == "MT"
+
+    # Find the AC count (alt chromosome count), for use in testing below.
+    match = re.search("AC=([\d\,]+)\;", infostr)
+    if match is None:
+        sys.stderr.write("Error:  Invalid VCF format, no AC info string:  %s\n" % infostr)
+        sys.exit(-1)
+    accnts = []
+    for val in match.group(1).split(","):
+        accnts.append(int(val))
+
+    # For each trio, determine if the proband has a de novo here, and add each of those probands
+    # to the denovolist.
+    denovolist = []
+    for i in range(len(pedlist)):
+        
+        pdict = getdict(formatstr, fields[idxlist[i][0]])
+        fdict = getdict(formatstr, fields[idxlist[i][1]])
+        mdict = getdict(formatstr, fields[idxlist[i][2]])
+
+        # Skip if the proband genotype is missing
+        if pdict["GT"] == "./.":
+            continue
+
+        # Skip if father or mother is not homozygous reference.
+        if fdict["GT"] != "0/0" or mdict["GT"] != "0/0":
+            continue
+
+        # Skip if proband does not have an heterozygotic alternate allele.
+        if chr.isdigit():
+            # For the autosomal chromosomes, the genotype needs to be "zero/non-zero"
+            if not (pdict["GT"][0] == "0" and pdict["GT"][2] != "0"):
+                continue
+
+        elif chr == "X":
+            # For the X chromosome, only test if the second genotype element is non-zero
+            #     (since males would be homozygous non-reference)
+            if pdict["GT"][2] == "0":
+                continue
+
+        else:
+            # Skip the Y chromosome, mitochrondria, and any decoy sequences
+            continue
+
+        # Compute the reference and alt allele coverage for the proband
+        f2 = pdict["AD"].split(",")
+        pRefCov = int(f2[0])
+        pAltCov = int(f2[1])
+        pDepth = pRefCov + pAltCov
+
+        # Skip if proband depth or alt coverage is too low.
+        if pDepth < 5 or pAltCov == 0 or pAltCov * 1.0 / pDepth < 0.18:
+            continue
+
+        # Skip if the father or mother depth is too low
+        if fdict["DP"] == '.' or mdict["DP"] == '.':
+            continue
+
+        if int(fdict["DP"]) < 5 or int(mdict["DP"]) < 5:
+            continue
+
+        # Skip if the Genotype Quality for any is too low
+        if int(pdict["GQ"]) < 20 or int(fdict["GQ"]) < 20 or int(mdict["GQ"]) < 20:
+            continue
+
+        # Skip if more than 10 samples in the cohort have the same variant.
+        pAlt = int(pdict["GT"][2])
+        if accnts[pAlt-1] > 10:
+            continue
+
+        # If the variant passes all of the test, add the proband to the de novo test.
+        denovolist.append(pedlist[i][0])
+
+    if len(denovolist) > 0:
+        fields[7] += ";denovo=" + ",".join(denovolist) + ";denovoCnt=" + str(len(denovolist))
+    else:
+        if not allFlag:
+            return
+        fields[7] += ";denovo=.;denovoCnt=0"
+
+    sys.stdout.write("\t".join(fields) + "\n")
+
+def getdict(formatstr, callstr):
+    f = formatstr.split(":")
+    f2 = callstr.split(":")
+    if f2[0] != "./." and len(f) < len(f2):
+        sys.stderr.write("Error:  Variant call does not match format string %s:  %s\n" % (formatstr, callstr))
+        sys.exit(-1)
+
+    dict = {}
+    for i in range(len(f2)):
+        dict[f[i]] = f2[i]
+
+    return dict
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+
+BIOINFROOT=/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo
+
+source $BIOINFROOT/setup-lang-mccleary.sh
+python $BIOINFROOT/soft/kinship_May2023/kinship.py $*

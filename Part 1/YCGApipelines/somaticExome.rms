@@ -1,0 +1,841 @@
+#!/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo/bin_May2023/rms
+
+##python
+
+import sys
+import os.path
+import re
+
+genome = "auto"
+nodes = ""
+
+# Check the command-line arguments, and output the genome name and chromosome ordering.
+argn = 1
+while argn < len(sys.argv):
+    if sys.argv[argn] == "-19":
+        genome = "hg19"
+        argn += 1
+    elif sys.argv[argn] == "-38":
+        genome = "hg38"
+        argn += 1
+    elif argn + 1 < len(sys.argv) and sys.argv[argn] == "-n":
+        nodes = sys.argv[argn+1]
+        argn += 2
+    else:
+        break
+
+errFlag = False
+if genome == "auto":
+    sys.stderr.write("Error:  The reference must be specified using either the -19 or -38 options.\n\n")
+    errFlag = True
+
+if errFlag or argn == len(sys.argv):
+    sys.stderr.write("Usage:  somaticExome.rms { -19 | -38 } [-n #] samples.txt\n")
+    sys.stderr.write("                -19  - Use hg19 as the reference genome.  One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -38  - Use GRCh38 as the reference genome. One of -19 and -38 must be given.\n")
+    sys.stderr.write("                -n # - Limit the number of compute nodes (same as RMS -n option format)\n")
+    sys.exit(-1)
+
+samplePairs = {}
+pairs = {}
+pairsamples = {}
+samples = []
+#sys.stdout.write("##sheet=EOF\n")
+#sys.stdout.write("Sample Pair Type\n")
+try:
+   fp = open(sys.argv[argn])
+   for line in fp.readlines():
+      line = line.strip()
+      if len(line) == 0:
+         continue
+      fields = line.split()
+      if len(fields) != 3:
+         sys.stderr.write("Error:  samples.txt lines must contain 3 columns, Sample, Pairname, Type:  %s\n" % line)
+         sys.exit(-1)
+
+      samples.append(fields[0])
+
+      type = fields[2].lower()
+      if type != 't' and type != 'n':
+          sys.stderr.write("Error:  samples.txt type value must be 't' or 'n':  %s\n" % line)
+          sys.exit(-1)
+
+      if fields[0] not in samplePairs:
+          samplePairs[fields[0]] = []
+      samplePairs[fields[0]].append((fields[1], type))
+
+      #sys.stdout.write("%s %s %s\n" % (fields[0], fields[1], type))
+
+      if fields[1] not in pairs:
+          pairs[fields[1]] = type
+          pairsamples[fields[1]] = [ fields[0] ]
+      else:
+          pairs[fields[1]] += type
+          pairsamples[fields[1]].append(fields[0])
+      
+   fp.close()
+except IOError:
+   sys.stderr.write("Error:  Unable to read samples.txt file:  %s\n" % sys.argv[argn])
+   sys.exit(-1)
+
+#sys.stdout.write("EOF\n")
+
+errFlag = False
+for pair in pairs:
+    if pairs[pair] != "tn" and pairs[pair] != "nt":
+        sys.stderr.write("Error:  Pair %s does not contain exactly 1 tumor and 1 normal sample:  %s\n" % (pair, ",".join(pairsamples[pair])))
+        errFlag = True
+if errFlag:
+    sys.exit(-1)
+
+readgroups = {}
+sampleCounts = {}
+
+# Save data for both spreadsheets
+# Write data for fastq splitting spreadsheet
+fileInfoSheetData = []
+pathSplitCount = {}
+sys.stdout.write('##sheet=EOF\n')
+sys.stdout.write('Path\tSplitPath\n')
+
+for currentDir in samples:
+    if currentDir.endswith('/'):
+        currentDir = currentDir[:-1]
+
+    sampleName = os.path.basename(currentDir)
+    unalignedDir = os.path.join(currentDir, 'Unaligned')
+    if not os.path.isdir(currentDir) or not os.path.isdir(unalignedDir):
+        sys.stderr.write('ERROR - Cannot find FASTQ files in sample directory: {0}\n'.format(currentDir))
+        sys.exit(-1)
+
+    count = 0
+    for currentR1 in os.listdir(unalignedDir):
+        if not ( currentR1.endswith('.fastq.gz') or currentR1.endswith('.fastq.qp') ):
+            continue
+
+        match = re.search("(.+)_(R\d)_(\d\d\d).(\d+m\.)?fastq.(gz|qp)$", currentR1)
+        if match is None:
+            sys.stderr.write('ERROR - FASTQ file name not in a parsable format: {0}\n'.format(currentR1))
+            sys.exit(-1)
+
+        if match.group(2) != "R1":
+            continue
+
+        pathR1 = os.path.join(unalignedDir, currentR1)
+
+        group = '{0}:::{1}'.format(sampleName, match.group(1))
+        if group not in readgroups:
+            if sampleName not in sampleCounts:
+                sampleCounts[sampleName] = 0
+            sampleCounts[sampleName] += 1
+            readgroups[group] = sampleCounts[sampleName]
+        rgId = readgroups[group]
+
+        count += 1
+        #sys.stdout.write('{0}\t{1}\t{2}\t{3}\n'.format(pathR1, sampleName, match.group(1), rgId))
+        fileInfoSheetData.append([pathR1, sampleName, match.group(1), rgId])
+
+        statInfo = os.stat(pathR1)
+        if '.qp' == currentR1[-3:]:
+            size = statInfo.st_size * 1.5
+        else:
+            size = statInfo.st_size
+        numFiles = int( statInfo.st_size / 400000000.0 + 0.5 ) # rounding to the nearest number.
+
+        pathR2 = pathR1.replace("_R1_", "_R2_")
+
+        if numFiles < 3 or not os.path.exists(pathR2):
+            numFiles = 1
+        elif numFiles > 30:
+            numFiles = 30
+        pathSplitCount[pathR1] = numFiles
+
+        ndx = 1
+        while ndx <= numFiles:
+            tempFileName = '{0}_split-{1:03}.fastq.gz'.format(currentR1[:-9], ndx)
+            sys.stdout.write('{0}\t{1}\n'.format(pathR1, tempFileName))
+            #splitPathData.append([ [pathR1, tempFileName] ])
+            ndx += 1
+    if 0 == count:
+        sys.stderr.write('ERROR - No FASTQ files found for sample: {0}\n'.format(currentDir))
+        sys.exit(-1)
+
+sys.stdout.write('EOF\n')
+
+# Write data for file info spread sheet
+sys.stdout.write('##sheet=EOF\n')
+sys.stdout.write('Path\tSample\tLane\tRGID\tSplitCount\tPair\tType\n')
+for record in fileInfoSheetData:
+    for pair in samplePairs[record[1]]:
+        sys.stdout.write('{0}\t{1}\t{2}\t{3}\t{4}\t{5}\t{6}\n'.format(record[0], record[1], record[2], record[3], pathSplitCount[record[0]], pair[0], pair[1]))
+sys.stdout.write('EOF\n')
+
+# Write the option values as parameters to RMS, along with the breakdown by chromosome.
+
+if nodes:
+   sys.stdout.write('##option="-n %s"\n' % nodes)
+
+sys.stdout.write("##genome=( %s )\n" % genome)
+sys.stdout.write("##region=( 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 decoy )\n")
+sys.stdout.write("##regionNoDecoy=( 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 )\n")
+
+if genome == "hg19":
+   sys.stdout.write("##regionBySize=( decoy 4 1 2 8 24 3 25 6 26 23 21 11 5 9 27 10 15 14 20 28 35 29 34 7 12 22 13 17 18 31 16 36 30 19 33 32 )\n")
+else:
+   sys.stdout.write("##regionBySize=( decoy 4 10 8 1 2 24 25 6 26 3 14 23 11 5 35 27 21 20 15 22 28 29 12 18 17 31 13 34 16 7 30 36 33 9 19 32 )\n")
+
+##env
+
+export YCGAROOT=/gpfs/gibbs/pi/ycga/mane/ycga_bioinfo
+export CONFIG=$YCGAROOT/config
+
+source $YCGAROOT/envs/setup-cytofWorkflow.sh
+source $YCGAROOT/lang/setup-mcc-java-1.8.0.sh
+
+export PATH=$PATH:$RMSDIR
+
+export ROOTDIR=$YCGAROOT/soft/somaticExome_May2023
+
+source $CONFIG/samtools-1.17
+source $CONFIG/picard-2.17.11
+source $CONFIG/gatk-3.4
+source $CONFIG/gatkutil_May2023
+source $CONFIG/tabix
+source $CONFIG/vcfAnnotate_May2023
+source $CONFIG/mutect
+source $CONFIG/indelocator
+
+if [ "<genome>" == "hg19" ] ; then
+   source $CONFIG/hs37d5
+else
+   source $CONFIG/hs38DH
+fi
+
+REFROOT=`echo $REF | sed 's/\.fasta//'`
+
+##local=$REF
+##local=${REF}.fai
+##local=${REFROOT}.dict
+
+REFBASE=`basename $REF`
+
+#### makeDir pair <pair>/working
+
+mkdir -p <pair>/working
+
+#### setup sample <sample>/.completed.finalbam
+
+mkdir -p <sample>/gatkExome_working
+
+for reg in <region> ; do
+   mkdir -p <sample>/gatkExome_working/region_$reg
+done
+mkdir -p <sample>/gatkExome_working/splitPathDir
+
+#### splitFastq path <sample>/.completed.finalbam
+##ppn=10
+##local=3x<path>
+##io=1
+
+source $CONFIG/quip
+source $CONFIG/pigz-2.7
+
+REALPWD=`realpath $PWD`
+R1PATH=$REALPWD/"<path>"
+R2PATH=`echo $R1PATH | sed 's/_R1_/_R2_/'`
+
+R1BASE=`basename "<path>"`
+if [ -e <sample>/gatkExome_working/.completed.$R1BASE.split ] ; then
+   exit 0
+fi
+
+if [ "1" == "<SplitCount>" ] ; then
+  R1SPLITPATH="<splitpath>"
+  if [ ${R1PATH: -3} == ".qp" ] ; then
+    quip -d -c $R1PATH | pigz -p 10 > `pwd`/<sample>/gatkExome_working/splitPathDir/$R1SPLITPATH
+
+    if [ -e $R2PATH ] ; then
+       R2SPLITPATH=`echo "$R1SPLITPATH" | sed 's/_R1_/_R2_/'`
+       quip -d -c $R2PATH | pigz -p 10 > `pwd`/<sample>/gatkExome_working/splitPathDir/$R2SPLITPATH
+    fi
+  else
+    ln -Ls $R1PATH `pwd`/<sample>/gatkExome_working/splitPathDir/$R1SPLITPATH
+
+    if [ -e $R2PATH ] ; then
+       R2SPLITPATH=`echo "$R1SPLITPATH" | sed 's/_R1_/_R2_/'`
+       ln -Ls $R2PATH `pwd`/<sample>/gatkExome_working/splitPathDir/$R2SPLITPATH
+    fi
+  fi
+else
+  splitFastq $R1PATH <sample>/gatkExome_working/splitPathDir/<splitPath,glob=True>
+fi
+
+touch <sample>/gatkExome_working/.completed.$R1BASE.split
+
+#### alignReads path,splitpath <sample>/.completed.<splitpath>.alignReads
+##ppn=16
+##local=6x<sample>/gatkExome_working/splitPathDir/<splitpath>
+##mem=20
+
+source $CONFIG/bwa-0.7.15
+
+R1="<sample>"/gatkExome_working/splitPathDir/"<splitpath>"
+R2=`echo $R1 | sed 's/_R1_/_R2_/'`
+
+LOCALR1=`basename $R1`
+LOCALR2=`basename $R2`
+
+if [ -e $R2 ] ; then
+   rmssync -L --bwlimit=50000 $R1 $R2 <tmp>
+
+   bwa mem -t <ppn> -Y -M -K 100000000 -R '@RG\tID:<sample>\tPL:ILLUMINA\tPU:<sample>\tSM:<sample>\tLB:<sample>-1' \
+      $REF <tmp>/$LOCALR1 <tmp>/$LOCALR2 |
+      demuxalignRegions <tmp>/tmp_<splitpath> $SPLIT_REGIONS
+else
+   rmssync -L --bwlimit=50000 $R1 <tmp>
+
+   bwa mem -t <ppn> -Y -M -K 100000000 -R '@RG\tID:<sample>\tPL:ILLUMINA\tPU:<sample>\tSM:<sample>\tLB:<sample>-1' \
+      $REF <tmp>/$LOCALR1 |
+      demuxalignRegions <tmp>/tmp_<splitpath> $SPLIT_REGIONS
+fi
+
+( cd <tmp> ; rms -p demuxsort.rms <tmp> <tmp>/tmp_*.split.bam <tmp>/tmp_*.<regionBySize,glob=True>.bam )
+
+for reg in <region> ; do
+   rmssync --bwlimit=50000 <tmp>/tmp_<splitpath>.$reg.sorted.bam <sample>/gatkExome_working/region_$reg/tmp_<splitpath>.$reg.bam
+done
+rmssync --bwlimit=50000 <tmp>/tmp_<splitpath>.split.sorted.bam <sample>/gatkExome_working/tmp_<splitpath>.split.bam
+
+touch <sample>/.completed.<splitpath>.alignReads
+
+rm -f $R1 $R2
+
+#### markDupsSplit sample <sample>/.completed.split.markDuplicates
+##ppn=2
+##local=2x<sample>/gatkExome_working/tmp_<splitpath,glob=True,sep=",">.split.bam
+##io=12
+
+rmssync --bwlimit=50000 <sample>/gatkExome_working/tmp_<splitpath,glob=True>.split.bam <tmp>
+
+picard MarkDuplicates I=<tmp>/tmp_<splitpath,glob=True>.split.bam O=<tmp>/<sample>.dedup.split.bam \
+      M=<tmp>/markdups_<sample>.txt ASSUME_SORT_ORDER=coordinate MAX_RECORDS_IN_RAM=2000000 \
+      COMPRESSION_LEVEL=1 CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT PROGRAM_RECORD_ID=null
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.dedup.split.ba[mi] <sample>/gatkExome_working
+
+touch <sample>/.completed.split.markDuplicates
+
+rm -f <sample>/gatkExome_working/tmp_<splitpath,glob=True>.split.bam
+
+#### markDups sample,regionBySize <sample>/.completed.<regionBySize>.markDuplicates
+##after=alignReads
+##ppn=2
+##local=2x<sample>/gatkExome_working/region_<regionBySize>/tmp_<splitpath,glob=True,sep=",">.<regionBySize>.bam
+##io=12
+
+rmssync --bwlimit=50000 <sample>/gatkExome_working/region_<regionBySize>/tmp_<splitpath,glob=True>.<regionBySize>.bam <tmp>
+
+picard MarkDuplicates I=<tmp>/tmp_<splitpath,glob=True>.<regionBySize>.bam O=<tmp>/<sample>.dedupinit.<regionBySize>.bam \
+      M=<tmp>/markdups_<sample>.txt ASSUME_SORT_ORDER=coordinate MAX_RECORDS_IN_RAM=2000000 \
+      COMPRESSION_LEVEL=1 CREATE_INDEX=true VALIDATION_STRINGENCY=LENIENT PROGRAM_RECORD_ID=null
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.dedupinit.<regionBySize>.ba[mi] <sample>/gatkExome_working
+
+#### markDupsMerge sample,regionBySize <sample>/.completed.<regionBySize>.markDuplicates
+##after=markDupsSplit,markDups
+##ppn=2
+##local=2x<sample>/gatkExome_working/<sample>.dedupinit.<regionBySize>.bam
+##io=16
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>.dedupinit.<regionBySize>.ba[mi] <tmp>
+
+samtools view -hb -L $SPLIT_REGIONS.<regionBySize>.bed \
+   <sample>/gatkExome_working/<sample>.dedup.split.bam > <tmp>/<sample>.dedup.split.bam
+
+samtools merge -c -p -@ <ppn> <tmp>/<sample>.dedup.<regionBySize>.bam \
+   <tmp>/<sample>.dedupinit.<regionBySize>.bam <tmp>/<sample>.dedup.split.bam
+
+samtools index <tmp>/<sample>.dedup.<regionBySize>.bam <tmp>/<sample>.dedup.<regionBySize>.bai
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.dedup.<regionBySize>.ba[mi] <sample>/gatkExome_working
+
+touch <sample>/.completed.<regionBySize>.markDuplicates
+
+rm -f <sample>/gatkExome_working/region_<regionBySize>/tmp_<splitpath,glob=True>.<regionBySize>.bam
+rm -f <sample>/gatkExome_working/<sample>.dedupinit.<regionBySize>.ba[mi]
+
+#### indelRealign sample,regionBySize <sample>/.completed.indelRealign
+##ppn=2
+##mem=16
+##io=16
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   cp <sample>/gatkExome_working/<sample>.dedup.<regionBySize>.bam <sample>/gatkExome_working/<sample>.realign.<regionBySize>.bam
+   cp <sample>/gatkExome_working/<sample>.dedup.<regionBySize>.bai <sample>/gatkExome_working/<sample>.realign.<regionBySize>.bai
+   exit 0
+fi
+
+if [ "<genome>" == "hg19" ] ; then
+   KNOWNOPT="-known $BUNDLE/zipped/1000G_phase1.indels.b37.vcf.gz -known $BUNDLE/zipped/Mills_and_1000G_gold_standard.indels.b37.vcf.gz"
+else
+   KNOWNOPT="-known $BUNDLE/zipped/1000G_phase1.indels.hg38.vcf.gz -known $BUNDLE/zipped/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+fi
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>.dedup.<regionBySize>.ba[mi] <tmp>
+
+gatk -T RealignerTargetCreator -R <local>/$REFBASE -I <tmp>/<sample>.dedup.<regionBySize>.bam \
+   -o <tmp>/<sample>.realign.intervals $KNOWNOPT --disable_auto_index_creation_and_locking_when_reading_rods \
+   -L $SPLIT_TARGETS.<regionBySize>.bed # -nt 8
+
+gatk -T IndelRealigner -R <local>/$REFBASE -I <tmp>/<sample>.dedup.<regionBySize>.bam $KNOWNOPT \
+   -targetIntervals <tmp>/<sample>.realign.intervals --disable_auto_index_creation_and_locking_when_reading_rods \
+   -o <tmp>/<sample>.realign.<regionBySize>.bam
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.realign.<regionBySize>.ba[mi] <sample>/gatkExome_working
+
+#### finishIndelRealign sample <sample>/.completed.indelRealign
+
+rm -f <sample>/gatkExome_working/<sample>.dedup.<region,glob=True>.ba[mi]
+
+touch <sample>/.completed.indelRealign
+
+#### baseRecalibrator sample <sample>/.completed.baseQualityRecal
+##after=indelRealign
+##ppn=2
+##mem=16
+##io=6
+
+# Cannot use the tmp directory for this, because it must access the whole sample's worth of data, not just a chromosome.
+
+if [ "<genome>" == "hg19" ] ; then
+   KNOWNOPT="-knownSites $BUNDLE/zipped/dbsnp_138.b37.vcf.gz -knownSites $BUNDLE/zipped/1000G_phase1.snps.high_confidence.b37.vcf.gz -knownSites $BUNDLE/zipped/Mills_and_1000G_gold_standard.indels.b37.vcf.gz"
+else
+   KNOWNOPT="-knownSites $BUNDLE/zipped/dbsnp_138.hg38.vcf.gz -knownSites $BUNDLE/zipped/1000G_phase1.snps.high_confidence.hg38.vcf.gz -knownSites $BUNDLE/zipped/Mills_and_1000G_gold_standard.indels.hg38.vcf.gz"
+fi
+
+# changed/removed options "-dfrac .1"  (exome calibration should use all of the data)
+gatk -T BaseRecalibrator -R <local>/$REFBASE \
+   <sample>/gatkExome_working/<sample>.realign.<regionNoDecoy,glob=True,prefix="-I ">.bam \
+   $KNOWNOPT --disable_auto_index_creation_and_locking_when_reading_rods \
+   -o <sample>/gatkExome_working/<sample>.recal.table \
+   -L $TARGETS # -nct 20
+
+#### printReads sample,regionBySize <sample>/.completed.baseQualityRecal
+##ppn=2
+##mem=16
+##io=8
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>.realign.<regionBySize>.ba[mi] <tmp>
+
+gatk -T PrintReads -R <local>/$REFBASE -I <tmp>/<sample>.realign.<regionBySize>.bam \
+   -o <tmp>/<sample>.recal.<regionBySize>.bam \
+   -BQSR <sample>/gatkExome_working/<sample>.recal.table --disable_indel_quals # -nct 8
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.recal.<regionBySize>.ba[mi] <sample>/gatkExome_working
+
+#### finishBaseRecal sample <sample>/.completed.baseQualityRecal
+
+rm -f <sample>/gatkExome_working/<sample>.realign.<regionNoDecoy,glob=True>.ba[mi]
+
+touch <sample>/.completed.baseQualityRecal
+
+#### haplotypeCaller sample,regionBySize <sample>/.completed.haplotypeCaller
+##ppn=1
+##mem=16
+##local=4x<sample>/gatkExome_working/<sample>.recal.<regionBySize>.bam
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>.recal.<regionBySize>.ba[mi] <tmp>
+
+gatk -T HaplotypeCaller -R <local>/$REFBASE -I <tmp>/<sample>.recal.<regionBySize>.bam \
+   -o <tmp>/<sample>_gatk.<regionBySize>.g.vcf.gz -ERC BP_RESOLUTION -mmq 10 -L $SPLIT_TARGETS.<regionBySize>.bed
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>_gatk.<regionBySize>.g.vcf.gz* <sample>/gatkExome_working
+
+#### freebayes sample,regionBySize <sample>/.completed.haplotypeCaller
+##after=finishBaseRecal
+##ppn=1
+##local=4x<sample>/gatkExome_working/<sample>.recal.<regionBySize>.bam
+
+source $CONFIG/freebayes-1.1.0-mcc
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>.recal.<regionBySize>.ba[mi] <tmp>
+
+fbcall <local>/$REFBASE $SPLIT_TARGETS.<regionBySize>.bed <tmp>/<sample>.recal.<regionBySize>.bam \
+   <tmp>/<sample>_freebayes_calls.<regionBySize>.vcf
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>_freebayes_calls.<regionBySize>.vcf <sample>/gatkExome_working
+
+#### fixGVCF sample,regionBySize <sample>/.completed.haplotypeCaller
+##after=haplotypeCaller,freebayes
+#local=4x<sample>/gatkExome_working/<sample>_gatk.<regionBySize>.g.vcf.gz
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+rmssync -t --bwlimit=50000 <sample>/gatkExome_working/<sample>_gatk.<regionBySize>.g.vcf.gz <sample>/gatkExome_working/<sample>_freebayes_calls.<regionBySize>.vcf <tmp>
+
+fixgvcf.py <tmp>/<sample>_freebayes_calls.<regionBySize>.vcf <tmp>/<sample>_gatk.<regionBySize>.g.vcf.gz | \
+  bgzip -c > <tmp>/<sample>.<regionBySize>.g.vcf.gz
+
+tabix <tmp>/<sample>.<regionBySize>.g.vcf.gz
+
+rmssync -t --bwlimit=50000 <tmp>/<sample>.<regionBySize>.g.vcf.gz* <sample>
+
+#### mergeGVCF sample <sample>/.completed.haplotypeCaller
+##ppn=4
+##mem=12
+##io=4
+
+bcftools concat --threads 6 -o <sample>/<sample>.g.vcf.gz -O z <sample>/<sample>.<regionNoDecoy,glob=True>.g.vcf.gz
+tabix <sample>/<sample>.g.vcf.gz
+
+rm -f <sample>/<sample>.<regionNoDecoy,glob=True>.g.vcf*
+
+touch <sample>/.completed.haplotypeCaller
+
+#### mutectChrom pair,regionBySize <pair>/working/<pair>.mutect.vcf
+##after=finishBaseRecal
+##normal=sample if type=n
+##tumor=sample if type=t
+##ppn=1
+##local=4x<tumor>/gatkExome_working/<tumor>.recal.<regionBySize>.bam
+##mem=12
+##io=10
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+source $YCGAROOT/lang/setup-mcc-java-1.7.0.sh
+
+rmssync -t --bwlimit=50000 <normal>/gatkExome_working/<normal>.recal.<regionBySize>.ba[mi] <tumor>/gatkExome_working/<tumor>.recal.<regionBySize>.ba[mi] <tmp>
+
+if [ "<genome>" == "hg19" ] ; then
+    DBOPT="--dbsnp $BUNDLE/dbsnp_138.b37.vcf --cosmic $ROOTDIR/databases/CosmicCodingMuts_v68.vcf"
+else
+    DBOPT="--dbsnp $BUNDLE/dbsnp_138.hg38.vcf --cosmic $ROOTDIR/databases/CosmicCodingMuts_v72.hg38.vcf"
+fi
+
+mutect -T MuTect -R <local>/$REFBASE -L $SPLIT_TARGETS.<regionBySize>.bed $DBOPT \
+    --max_alt_alleles_in_normal_count 6 --max_alt_allele_in_normal_fraction 0.1 \
+    --max_alt_alleles_in_normal_qscore_sum 200 \
+    -I:normal <tmp>/<normal>.recal.<regionBySize>.bam -I:tumor <tmp>/<tumor>.recal.<regionBySize>.bam \
+    --out <tmp>/<pair>.mutect.<regionBySize>.call_stats.txt \
+    -vcf <tmp>/<pair>.mutect.<regionBySize>.vcf
+
+cp <tmp>/<pair>.mutect.<regionBySize>.call_stats.txt <tmp>/<pair>.mutect.<regionBySize>.vcf <pair>/working
+
+#### mutect pair <pair>/working/<pair>.mutect.vcf
+##io=10
+
+cat <pair>/working/<pair>.mutect.<regionNoDecoy,glob=True>.call_stats.txt > <pair>/working/<pair>.mutect.call_stats.txt
+
+java -Xmx10g -XX:ParallelGCThreads=6 -cp $GATKJAR org.broadinstitute.gatk.tools.CatVariants \
+   <regionNoDecoy,prefix="-V <pair>/working/<pair>.mutect.",suffix=".vcf"> -R <local>/$REFBASE \
+   -out <pair>/working/<pair>.mutect.vcf -assumeSorted
+
+rm -f <pair>/working/<pair>.mutect.<regionNoDecoy,glob=True>.call_stats.*
+rm -f <pair>/working/<pair>.mutect.<regionNoDecoy,glob=True>.vcf*
+
+#### indelocatorChrom pair,regionBySize <pair>/working/<pair>.indels.vcf
+##after=finishBaseRecal
+##normal=sample if type=n
+##tumor=sample if type=t
+##ppn=1
+##mem=24
+##io=10
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+source $YCGAROOT/lang/setup-mcc-java-1.7.0.sh
+
+rmssync -t --bwlimit=50000 <normal>/gatkExome_working/<normal>.recal.<regionBySize>.ba[mi] <tumor>/gatkExome_working/<tumor>.recal.<regionBySize>.ba[mi] <tmp>
+
+indelocator -T IndelGenotyperV2 -R <local>/$REFBASE -L $SPLIT_TARGETS.<regionBySize>.bed \
+    -I:normal <tmp>/<normal>.recal.<regionBySize>.bam -I:tumor <tmp>/<tumor>.recal.<regionBySize>.bam \
+    --somatic --window_size 400 --maxNumberOfReads 8000 \
+    --minCoverage 6 --minNormalCoverage 4 --minFraction 0.2 \
+    -o <tmp>/<pair>.indels.<regionBySize>.vcf
+
+cp <tmp>/<pair>.indels.<regionBySize>.vcf <pair>/working/<pair>.indels.<regionBySize>.vcf
+
+#### indelocator pair <pair>/working/<pair>.indels.vcf
+##io=20
+
+java -Xmx10g -XX:ParallelGCThreads=6 -cp $GATKJAR org.broadinstitute.gatk.tools.CatVariants \
+   <regionNoDecoy,prefix="-V <pair>/working/<pair>.indels.",suffix=".vcf"> -R <local>/$REFBASE \
+   -out <pair>/working/<pair>.indels.vcf -assumeSorted
+
+rm -f <pair>/working/<pair>.indels.<regionNoDecoy,glob=True>.vcf*
+
+#### mergeFinalBam sample <sample>/.completed.finalbam
+##after=mergeGVCF,mutect,indelocator
+##ppn=4
+##io=2
+
+samtools cat <sample>/gatkExome_working/<sample>.recal.<region,glob=True>.bam > <sample>/<sample>.bam
+samtools index <sample>/<sample>.bam <sample>/<sample>.bai
+
+#### completeFinalBam sample <sample>/.completed.finalbam
+##after=mergeGVCF,mergeFinalBam
+
+rm -rf <sample>/gatkExome_working
+
+touch <sample>/.completed.finalbam
+
+#### exomeMetrics sample <sample>/exomeMetrics_<sample>.txt
+##after=mergeFinalBam
+##ppn=4
+##io=4
+
+WHICHOPT="-38"
+if [ "<genome>" == "hg19" ] ; then
+   WHICHOPT=""
+fi
+KIT=`whichexome.py $WHICHOPT <sample>/<sample>.bam | cut -f1`
+if [ $KIT == "IDT" ] ; then
+   BED=$IDT_TARGET_REGIONS
+elif [ $KIT == "IDTv2" ] ; then
+   BED=$IDTV2_TARGET_REGIONS
+elif [ $KIT == "MedExome" ] ; then
+   BED=$MEDEXOME_TARGET_REGIONS
+elif [ $KIT == "V2" ] ; then
+   BED=$V2_TARGET_REGIONS
+else
+   echo "whichexome: <sample>" `whichexome.py $WHICHOPT $BAM` 
+   BED=$CODING_REGIONS
+   KIT=Coding
+fi
+
+bamMetrics -t 4 -r <local>/$REFBASE -b $BED <sample>/<sample>.bam > <sample>/exomeMetrics_<sample>.txt
+bamMetrics -t 4 -r <local>/$REFBASE -b $CODING_REGIONS -c <sample>/<sample>_trcov.txt <sample>/<sample>.bam > /dev/null
+
+echo -e "Targets:\t$KIT" >> <sample>/exomeMetrics_<sample>.txt
+
+#### mergeMetrics pair <pair>/working/exomeMetrics_<pair>.txt
+##normal=sample if type=n
+##tumor=sample if type=t
+
+statsmerge.py <normal>/exomeMetrics_*.txt <tumor>/exomeMetrics_*.txt > <pair>/working/exomeMetrics_<pair>.txt
+
+#### Mantis pair <pair>/working/<pair>.mantis.status
+##after=mergeFinalBam
+##ppn=4
+##io=6
+##normal=sample if type=n
+##tumor=sample if type=t
+
+source $CONFIG/mantis
+
+ln -s `pwd`/<normal>/<normal>.bam <tmp>/<normal>.bam
+ln -s `pwd`/<normal>/<normal>.bai <tmp>/<normal>.bam.bai
+ln -s `pwd`/<tumor>/<tumor>.bam <tmp>/<tumor>.bam
+ln -s `pwd`/<tumor>/<tumor>.bai <tmp>/<tumor>.bam.bai
+
+mantis --bedfile $MANTIS_EXOME_BED --genome <local>/$REFBASE -n <tmp>/<normal>.bam -t <tmp>/<tumor>.bam \
+   --threads 4 -mrq 20.0 -mlq 25.0 -mlc 20 -mrr 1 \
+   -o <pair>/working/<pair>.mantis
+
+#### GenotypeGVCF pair,regionBySize <pair>/working/exome_calls.vcf
+##after=mergeGVCF
+##ppn=2
+##mem=40
+
+if [ "<regionBySize>" == "decoy" ] ; then
+   exit 0
+fi
+
+for sample in <sample>; do
+   echo ${sample}/${sample}.g.vcf.gz >> <tmp>/rawcalls.<regionBySize>.gvcf.list
+done
+
+java -Xmx35g -XX:ParallelGCThreads=4 -jar $GATKJAR -T GenotypeGVCFs \
+   -R <local>/$REFBASE -V <tmp>/rawcalls.<regionBySize>.gvcf.list \
+   -o <tmp>/rawcalls.<regionBySize>.vcf.gz -L $SPLIT_TARGETS.<regionBySize>.bed \
+   -stand_emit_conf 10 --disable_auto_index_creation_and_locking_when_reading_rods # -nt 2
+
+rmssync -t --bwlimit=50000 <tmp>/rawcalls.<regionBySize>.vcf* <pair>/working
+
+#### mergeVCF pair <pair>/working/exome_calls.vcf
+
+cd <pair>/working
+
+bcftools concat --threads 6 -o <tmp>/rawcalls.vcf.gz -O z rawcalls.<regionNoDecoy,glob=True>.vcf.gz
+tabix <tmp>/rawcalls.vcf.gz
+
+rmssync -t --bwlimit=50000 <tmp>/rawcalls.vcf.gz* .
+
+rm -f rawcalls.<regionNoDecoy,glob=True>.vcf*
+
+#### HardFiltering pair <pair>/working/exome_calls.vcf
+##mem=16
+
+cd <pair>/working
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType SNP -o <tmp>/raw_snps.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_snps.vcf -o <tmp>/filtered_snps.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0 || MQRankSum < -12.5 || ReadPosRankSum < -8.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType INDEL -o <tmp>/raw_indels.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_indels.vcf -o <tmp>/filtered_indels.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 200.0 || ReadPosRankSum < -20.0 || MQ < 35.0"
+
+gatk -T SelectVariants -R <local>/$REFBASE -V rawcalls.vcf.gz -selectType MIXED -o <tmp>/raw_mixed.vcf
+gatk -T VariantFiltration -R <local>/$REFBASE -V <tmp>/raw_mixed.vcf -o <tmp>/filtered_mixed.vcf --filterName "HardFilter" \
+   --filterExpression "DP < 4 || QD < 2.0 || FS > 60.0 || MQ < 35.0"
+
+gatk -T CombineVariants -R <local>/$REFBASE -V <tmp>/filtered_snps.vcf -V <tmp>/filtered_indels.vcf -V <tmp>/filtered_mixed.vcf \
+   -o <tmp>/exome_calls.vcf --assumeIdenticalSamples
+
+gatkLowQualityFilter.py <local>/$REFBASE <tmp>/exome_calls.vcf > exome_calls.vcf
+
+#### somaticCalling pair <pair>/working/<pair>.variants.xls
+##after=HardFiltering,mutect,indelocator
+##normal=sample if type=n
+##tumor=sample if type=t
+##ppn=4
+##io=6
+
+cd <pair>/working
+
+if [ "<genome>" == "hg19" ] ; then
+   OPT="-19"
+else
+   OPT="-38"
+fi
+
+python $ROOTDIR/scripts/vcfMerge.py <tumor> exome_calls.vcf <pair>.mutect.vcf <pair>.mutect.call_stats.txt <pair>.indels.vcf <pair>.allvariants.tmp.vcf
+
+python $ROOTDIR/scripts/vcfAddStrandDepth.py <pair>.allvariants.tmp.vcf ../../<tumor>/<tumor>.bam ../../<normal>/<normal>.bam <pair>.allvariants.vcf
+
+vcfAnnotate $OPT <pair>.allvariants.vcf
+
+#### makeEdits pair <pair>/<pair>_edits.txt
+##after=HardFiltering,Mantis
+##normal=sample if type=n
+##tumor=sample if type=t
+
+MSISCORE=`grep DIF <pair>/working/<pair>.mantis.status | cut -f2`
+MSIEVAL=`grep DIF <pair>/working/<pair>.mantis.status | cut -f4`
+
+cd <pair>
+
+rm -f <pair>_edits.txt
+echo "StartScale=1.0" >> <pair>_edits.txt
+echo "EndScale=1.0" >> <pair>_edits.txt
+echo "Ploidy=.5" >> <pair>_edits.txt
+echo "TumorBAF=0.0" >> <pair>_edits.txt
+echo "Purity=0.0" >> <pair>_edits.txt
+echo "Genome=<genome>" >> <pair>_edits.txt
+echo "Normal=<normal>" >> <pair>_edits.txt
+echo "Tumor=<tumor>" >> <pair>_edits.txt
+echo "MSIEvaluation=$MSIEVAL" >> <pair>_edits.txt
+echo "MSIScore=$MSISCORE" >> <pair>_edits.txt
+
+#### lohCalling pair <pair>/working/<pair>.lohshort.xls
+##after=makeEdits
+cd <pair>/working
+
+source $YCGAROOT/envs/setup-rpy2-mccleary.sh
+
+TUMOR=`grep '^Tumor=' ../<pair>_edits.txt | cut -f2 -d=`
+
+python $ROOTDIR/scripts/makeGWMAF.py exome_calls.vcf $TUMOR <pair>_pair.GW_MAF
+
+python $ROOTDIR/scripts/p01LOHplot.py <pair> <pair>_pair.GW_MAF
+
+python $ROOTDIR/scripts/callPurity.py <pair>_LOHlist.txt ../<pair>_edits.txt
+
+python $ROOTDIR/scripts/p02ExtractLOH.py <pair>_LOHlist.txt <pair>.lohshort.xls
+
+#### somaticAnnotate pair <pair>/working/<pair>.variants.xls
+##after=somaticCalling,lohCalling
+cd <pair>/working
+
+python $ROOTDIR/scripts/somaticAnnotate.py <pair>.allvariants_anno.vcf <pair>.allvariants_anno.coding.xls <pair>.lohshort.xls <tmp>/<pair>.variants.vcf <tmp>/<pair>.variants.xls
+
+mv <tmp>/<pair>.variants.vcf <tmp>/<pair>.variants.xls .
+
+#### cnvCalling pair <pair>/working/<pair>.cnvshort.xls
+##after=mergeMetrics,lohCalling,makeEdits
+
+cd <pair>
+
+PAIR=`basename $PWD`
+
+cd working
+
+TUMOR=`grep '^Tumor=' ../${PAIR}_edits.txt | cut -f2 -d=`
+NORMAL=`grep '^Normal=' ../${PAIR}_edits.txt | cut -f2 -d=`
+START_SCALE=`grep '^StartScale=' ../${PAIR}_edits.txt | cut -f2 -d=`
+END_SCALE=`grep '^EndScale=' ../${PAIR}_edits.txt | cut -f2 -d=`
+PLOIDY=`grep '^Ploidy=' ../${PAIR}_edits.txt | cut -f2 -d=`
+PURITY=`grep '^Purity=' ../${PAIR}_edits.txt | cut -f2 -d=`
+
+echo Updating...
+
+python $ROOTDIR/scripts/makeCovRatio.py $START_SCALE $END_SCALE \
+     ../../$TUMOR/${TUMOR}_trcov.txt ../../$TUMOR/exomeMetrics_$TUMOR.txt \
+     ../../$NORMAL/${NORMAL}_trcov.txt ../../$NORMAL/exomeMetrics_$NORMAL.txt \
+     $PAIR.cov_ratio
+
+echo Recomputing CNV...
+
+source $YCGAROOT/envs/setup-rpy2-mccleary.sh
+
+python $ROOTDIR/scripts/p01CNV_segmentation.py $PAIR.cov_ratio.murim $PAIR
+
+python $ROOTDIR/scripts/p02callCNV.py $PLOIDY $PURITY $PAIR ${PAIR}_CBS_calling.txt ${PAIR}.cnvshort.xls ${PAIR}.cnvfull.txt
+
+#### makePlot pair <pair>/<pair>_bafplot.png
+##after=mergeMetrics,lohCalling,cnvCalling
+
+cd <pair>
+
+PAIR=`basename $PWD`
+
+echo Updating files...
+
+python $ROOTDIR/scripts/makeCNVEdit.py working/${PAIR}.cnvshort.xls working/${PAIR}.lohshort.xls working/${PAIR}.cov_ratio.murim ${PAIR}.cnvedit.txt
+
+python $ROOTDIR/scripts/makeLOHEdit.py working/${PAIR}.cnvshort.xls working/${PAIR}.lohshort.xls working/${PAIR}_pair.GW_MAF ${PAIR}.lohedit.txt
+
+
+GENOME=`grep '^Genome' ${PAIR}_edits.txt | cut -f2 -d=`
+if [ $GENOME == "hg19" ] ; then
+   OPT="-19"
+else
+   OPT="-38"
+fi
+
+python $ROOTDIR/scripts/somaticRegions.py $OPT working/${PAIR}.cnvshort.xls working/$PAIR.cnv.xls
+
+python $ROOTDIR/scripts/somaticRegions.py $OPT working/${PAIR}.lohshort.xls working/$PAIR.loh.xls
+
+echo Making plot...
+
+python $ROOTDIR/scripts/makeBAFplot.py working/exome_calls.vcf working/$PAIR.cov_ratio ${PAIR}_edits.txt working/$PAIR.cnv.xls working/$PAIR.loh.xls ${PAIR}_bafplot.png
+
+#### makeReport pair <pair>/<pair>.report.xlsx
+##after=makePlot,somaticAnnotate
+
+cd <pair>
+
+PAIR=`basename $PWD`
+
+echo Making report...
+
+python $ROOTDIR/scripts/kinship.py ${PAIR}_edits.txt working/$PAIR.allvariants_anno.coding.xls working/$PAIR.variants.xls
+
+python $ROOTDIR/scripts/makeReport2.py ${PAIR}_edits.txt working/exomeMetrics_$PAIR.txt working/$PAIR.variants.xls working/$PAIR.cnv.xls working/$PAIR.loh.xls $PAIR.report.xlsx

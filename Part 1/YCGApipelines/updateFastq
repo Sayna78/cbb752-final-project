@@ -1,0 +1,380 @@
+#!/bin/python3
+
+import sys
+import datetime
+import getpass
+import inspect
+import os
+import re
+import subprocess
+import tempfile
+import time
+import shutil
+
+BINDIR = os.path.dirname(os.path.realpath(inspect.stack()[0][1]))
+
+OLDPANFSROOT="/gpfs/project/ycga/data"
+PANFSROOT="/gpfs/ycga/sequencers"
+
+debugFlag = False
+noNoticeFlag = False
+silentFlag = False
+noAskFlag = False
+arg = 1
+if arg < len(sys.argv) and sys.argv[arg] == "-f":
+   silentFlag = True
+   arg += 1
+elif arg < len(sys.argv) and sys.argv[arg] == "-n":
+   noNoticeFlag = True
+   arg += 1
+elif arg < len(sys.argv) and sys.argv[arg] == "-a":
+   noAskFlag = True
+   arg += 1
+elif arg < len(sys.argv) and sys.argv[arg] == "-d":
+   if getpass.getuser() in ("jk2269", "rdb9"):
+      debugFlag = True
+   arg += 1
+
+if len(sys.argv) - arg < 1:
+   sys.stderr.write("Usage:  updateFastq sampleDir...\n")
+   sys.stderr.write("          Updates the symbolic links to the FASTQ files in the Unaligned directories, for\n")
+   sys.stderr.write("          past changes to the locations where YCGA sequencing data is stored.  Also, identifies\n")
+   sys.stderr.write("          run data that has been written to tape archive, and on request, will perform a\n")
+   sys.stderr.write("          retrieval of those files from tape, storing the retrieved FASTQ files in the\n")
+   sys.stderr.write("          sampleDir/Unaligned directories (so that these directories are now correctly setup\n")
+   sys.stderr.write("          for use in analysis pipelines.\n")
+   sys.exit(-1)
+
+errFlag = False
+for dir in sys.argv[arg:]:
+    if dir.endswith("/"):
+       dir = dir[:-1]
+
+    if not os.path.isdir(dir) or not os.path.isdir(dir + "/Unaligned"):
+       sys.stderr.write("Error:  Cannot find directory:  %s/Unaligned\n" % dir)
+       errFlag = True
+if errFlag:
+   sys.exit(-1)
+
+deniedlist = []
+restorelist = []
+
+for dir in sys.argv[arg:]:
+   if dir.endswith("/"):
+      dir = dir[:-1]
+
+   files = {}
+   udir = dir + "/Unaligned"
+   for file in os.listdir(udir):
+      if file.endswith("fastq.gz") or file.endswith("fastq.qp"):
+         if file not in files:
+            files[file] = [ file, "" ]
+         else:
+            files[file][0] = file
+      elif file.endswith("fastq.gz.link") or file.endswith("fastq.qp.link"):
+         name = file[:-5]
+         if name not in files:
+            files[name] = [ "", file ]
+         else:
+            files[name][1] = file
+
+   if len(files) == 0:
+      sys.stderr.write("Error:  No fastq files found in directory: %s\n" % udir)
+      sys.exit(-1)
+
+   deniedPath = ""
+   samplerestorelist = []
+   
+   updatecnt = 0
+   linkcnt = 0
+   for name in files:
+      (file, link) = files[name]
+
+      # If the fastq file and the .link file are both there, then the fastq file better be real.
+      
+      if file and link:
+         fpath = udir + "/" + file
+         if os.path.isfile(fpath):
+            continue
+
+         sys.stderr.write("Error:  Found .link file, but FASTQ file is not a real file:  %s\n" % (fpath))
+         sys.exit(-1)
+
+      # If the fastq file is there (as a real file or a symbolic link), but the .link file is not
+      # (which could be because (1) the run has not been archived, and so the file should be real,
+      # (2) the run was from the old panfs area, so the path needs to be updated, or (3) the run
+      # was archived since the link was created, so we need to make a .link file from it).
+
+      if file:
+         fpath = udir + "/" + file
+         if os.path.isfile(fpath) and not os.path.islink(fpath):
+            continue
+
+         if not os.path.islink(fpath):
+            sys.stderr.write("Error:  FASTQ not a file or symbolic link:  %s\n" % (fpath))
+            sys.exit(-1)
+
+         # If the "fastq file" is really a symbolic link, if it points at a real file, then
+         # nothing more needs to be done.
+
+         absfpath = os.path.abspath(fpath)
+
+         dest = os.readlink(fpath)
+         if os.path.isfile(dest):
+            continue
+
+         # If the destination file is not there, check that the path conversion does not
+         # result in finding an existing file, possibly with a Quip'ed version of the gzip file.
+
+         newdest = dest
+         if dest.startswith("/panfs/"):
+            newdest = PANFSROOT + dest
+         elif dest.startswith(OLDPANFSROOT):
+            newdest = PANFSROOT + dest.replace(OLDPANFSROOT, "")
+         elif dest.startswith("/ycga-ba/"):
+            newdest = "/gpfs/ycga/sequencers" + dest
+         elif dest.startswith("/ycga-gpfs/"):
+            newdest = dest.replace("/ycga-gpfs", "/gpfs/ycga")
+         elif dest.startswith("/sequencers/"):
+            newdest = "/gpfs/ycga" + dest
+         #elif dest.startswith("/gpfs/ycga/"):
+         #   newdest = dest.replace("/gpfs/ycga", "/ycga-gpfs")
+         
+         if os.path.isfile(newdest):
+            os.unlink(fpath)
+            os.symlink(newdest, absfpath)
+            continue
+
+         if newdest.endswith("fastq.gz") and os.path.isfile(newdest[:-2] + "qp"):
+            newdest = newdest[:-2] + "qp"
+            absfpath = absfpath[:-2] + "qp"
+            os.unlink(fpath)
+            os.symlink(newdest, absfpath)
+            updatecnt += 1
+            continue
+
+         # If no destination file can be found, check if the sample directory can be found, which
+         # means that the user no longer has access to the fastq files.
+         sampledirdest = os.path.dirname(newdest)
+         if os.path.isdir(sampledirdest):
+            deniedPath = sampledirdest
+            break
+         
+         # If no destination file can be found, check that the run has been deleted, and if so,
+         # make this a .link file, to prepare it for restoring from archive.
+         match = re.match("(.+)/Data/Intensities/BaseCalls", newdest)
+         if match is None:
+            sys.stderr.write("Error:  Cannot find FASTQ file destination:  %s -> %s\n" % (fpath, newdest))
+            sys.exit(-1)
+
+         runpath = match.group(1)
+         if os.path.isdir(runpath):
+            sys.stderr.write("Error:  Run path found, but FASTQ file does not exist:  %s -> %s\n" % (fpath, newdest))
+            sys.exit(-1)
+
+         if not os.path.isfile(runpath + ".DELETED") and not os.path.isdir(runpath + ".deleted"):
+            sys.stderr.write("Error:  Cannot find FASTQ file destination run:  %s -> %s\n" % (fpath, newdest))
+            sys.exit(-1)
+
+         newdest = newdest[:-2] + "qp"
+         absfpath = absfpath[:-2] + "qp"
+         os.unlink(fpath)
+         os.symlink(newdest, absfpath + ".link")
+         updatecnt += 1
+         link = file[:-2] + "qp.link"
+         file = ""
+
+      # Update links with a deprecated path.
+      lpath = udir + "/" + link
+      ldest = os.readlink(lpath)
+      if ldest.find("/ycga-gpfs/") != -1:
+         lnewdest = ldest.replace("/ycga-gpfs", "/gpfs/ycga")
+         os.unlink(lpath)
+         os.symlink(lnewdest, lpath)
+
+      # If there is a .link file, but no fastq file exists, mark it for restoration in the next phase.
+      samplerestorelist.append((udir, link))
+      linkcnt += 1
+
+   if deniedPath:
+      if not (silentFlag or noNoticeFlag):
+         sys.stdout.write("Error: Access denied to fastq files:  %s\n" % (deniedPath))
+      deniedlist.append(dir)
+
+      datestr = datetime.datetime.now().strftime("%Y%m%d_%H:%M:%S")
+      logfile = "/gpfs/ycga/project/mane/jk2269/ycgaFastq_logFiles/ycgaAccess.denied.log"
+      fp = open(logfile, "at")
+      fp.write("%s:  updateFastq - %s - %s\n" % (datestr, getpass.getuser(), "Access denied to some files."))
+      fp.close()
+   else:
+      restorelist += samplerestorelist
+      if not (silentFlag or noNoticeFlag):
+         sys.stdout.write("%s:  Updated %d of %d files, %d files must be retrieved from archive.\n" % (dir, updatecnt, len(files), linkcnt))
+
+if len(deniedlist) > 0:
+   sys.stdout.flush()
+   sys.stderr.write("Error:  Access denied to fastq files for %d sample%s.  Unable to restore.\n" % (len(deniedlist), "" if len(deniedlist) == 1 else "s"))
+   sys.stderr.flush()
+   
+if len(restorelist) == 0:
+   sys.exit(0)
+   
+projectlist = set()
+runlist = []
+for t in restorelist:
+   fpath = t[0] + "/" + t[1]
+   absfpath = os.path.abspath(fpath)
+   dest = os.readlink(fpath)
+
+   match = re.match("(.+)/Data/Intensities/BaseCalls", dest)
+   if match is None:
+      sys.stderr.write("Error:  Invalid .link file destination:  %s -> %s\n" % (fpath, dest))
+      sys.exit(-1)
+
+   runpath = match.group(1)
+   projectpath = ""
+   sampledir = ""
+   filename = ""
+   
+   match = re.search("(Data/Intensities/BaseCalls/Unalign[^/]+/Project_[^/]+)/(Sample_[^/]+)/(.*)$", dest)
+   if match is not None:
+      projectpath = match.group(1)
+      sampledir = match.group(2)
+      filename = match.group(3)
+   else:
+      match = re.search("(Data/Intensities/BaseCalls.*/GERALD[^/]+)/(.*)$", dest)
+      if match is not None:
+         projectpath = match.group(1)
+         sampledir = ""
+         filename = match.group(2)
+      else:
+         sys.stderr.write("Error:  Invalid destination path format:  %s -> %s\n" % (fpath, dest))
+         sys.exit(-1)
+
+   projectlist.add((runpath, projectpath))
+   runlist.append((runpath, projectpath, sampledir, filename, absfpath))
+
+def runcmd(cmd):
+   p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+   out, err = p.communicate()
+   return (p.returncode, out, err)
+
+if not silentFlag:
+   sys.stdout.write("%d archived directories must be retrieved to restore FASTQ files.  This will take some time to complete.\n" % len(projectlist))
+
+   if not noAskFlag:
+      get_input = input
+      try:
+          get_input = raw_input
+      except NameError:
+          pass
+
+      while True:
+         l = get_input("Continue (y/n)? [y] ")
+         if len(l) == 0 or l[0] == 'y' or l[0] == '\n':
+            break
+         elif l[0] == 'n':
+            sys.exit(0)
+         else:
+            sys.stdout.write("Please answer 'y' or 'n'.\n")
+
+numtarfiles = len(projectlist)
+numfastqfiles = 0
+
+errstatus = 0
+
+tmpdir = tempfile.mkdtemp(dir=".")
+try:
+   found = []
+   for (i, t) in enumerate(projectlist):
+      sampledirs = set()
+      fcnt = 0
+      for t2 in runlist:
+          if t2[0] == t[0] and t2[1] == t[1]:
+             sampledirs.add(t2[2])
+             fcnt += 1
+
+      numfastqfiles += fcnt
+      if not silentFlag:
+         sys.stdout.write("Retrieving %d of %d (%d files)...\n" % (i+1, len(projectlist), fcnt))
+
+      cmd = "%s/ycgaArchive %s -o %s %s %s" % (BINDIR, "-d" if debugFlag else "", tmpdir, t[0] + "/" + t[1],
+                                               "" if len(sampledirs) >= 18 else " ".join(sampledirs))
+      (status, out, err) = runcmd(cmd)
+      if status != 0:
+         if err.find("Access denied to samples") != -1:
+            sys.stderr.write(err)
+            errstatus = status
+            continue
+         
+         sys.stdout.write(out)
+         sys.stderr.write(err)
+         sys.exit(status)
+
+      if debugFlag and len(out) > 0:
+         sys.stdout.write("ycgaArchive succeeded, producing the following output:\n%s\n" % out)
+         sys.stdout.flush()
+      if debugFlag and len(err) > 0:
+         sys.stdout.write("ycgaArchive succeeded, but produced the following error messages:\n%s\n" % err)
+         sys.stdout.flush()
+         
+      for t2 in runlist:
+         if not (t2[0] == t[0] and t2[1] == t[1]): continue
+
+         src = "%s/%s/%s" % (tmpdir, t2[2], t2[3]) if t2[2] else "%s/%s" % (tmpdir, t2[3])
+         if debugFlag:
+            sys.stdout.write("Checking for %s.\n" % src)
+            sys.stdout.flush()
+         if os.path.isfile(src):
+            if debugFlag:
+               sys.stdout.write("   Found it.\n")
+               sys.stdout.flush()
+               
+            (code, out, err) = runcmd("/usr/bin/mv %s %s" % (src, t2[4].replace(".link", "")))
+            if code != 0 or len(err) > 0:
+               sys.stderr.write("Error:  Unable to change the file permissions for the fastq file:\n")
+               sys.stderr.write(out)
+               sys.stderr.write(err)
+               sys.exit(code)
+            (code, out, err) = runcmd("/usr/bin/chmod `umask -S | /usr/bin/sed 's/x//g'` %s" % t2[4].replace(".link", ""))
+            if code != 0 or len(err) > 0:
+               sys.stderr.write("Error:  Unable to change the file permissions for the fastq file:\n")
+               sys.stderr.write(out)
+               sys.stderr.write(err)
+               sys.exit(code)
+               
+            found.append(t2)
+
+      if not debugFlag:
+         runcmd("/usr/bin/rm -rf %s/*" % tmpdir)
+      else:
+         tmp2 = tempfile.mkdtemp(dir=tmpdir, prefix="copies_")
+         runcmd("/usr/bin/mv -f %s/* %s" % (tmpdir, tmp2))
+      
+finally:
+   if not debugFlag:
+      shutil.rmtree(tmpdir)
+
+if errstatus != 0:
+   sys.exit(errstatus)
+   
+try:
+   user = getpass.getuser()
+   datestr = datetime.datetime.now().strftime("%Y%m%d_%H:%M:%S")
+   logfile = "/gpfs/ycga/project/mane/jk2269/ycgaFastq_logFiles/updateFastq.log"
+   fp = open(logfile, "at")
+   fp.write("%s\t%s\t%d tar files\t%d fastq files\n" % (user, datestr, numtarfiles, numfastqfiles))
+   fp.close()
+
+except IOError:
+   pass
+
+if len(found) == len(runlist):
+   if not silentFlag:
+      sys.stdout.write("All files retrieved.\n")
+else:
+   sys.stderr.write("Error:  %d files could not be retrieved.\n" % (len(runlist) - len(found)))
+   for t in set(runlist) - set(found):
+      sys.stderr.write("    %s\n" % t[4].replace(".link", ""))
+   sys.exit(-1)
+
